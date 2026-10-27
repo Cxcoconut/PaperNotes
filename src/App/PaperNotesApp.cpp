@@ -41,6 +41,7 @@ constexpr UINT kTrayMenuNew = 1001;
 constexpr UINT kTrayMenuList = 1002;
 constexpr UINT kTrayMenuExit = 1003;
 constexpr UINT kTrayMenuOpenList = 1004;
+constexpr UINT kTrayMenuHotkeys = 1005;
 // Note entries occupy a contiguous command-id range above the fixed commands.
 constexpr UINT kTrayMenuFirstNote = 2000;
 
@@ -62,7 +63,8 @@ constexpr ULONGLONG kMaxAnchorAgeMs = 120 * 1000;
 constexpr int kHotkeyNewNote = 1;
 constexpr int kHotkeyToggleList = 2;
 bool g_hotkeyNewNote = false;
-bool g_hotkeyToggleList = false;// If the hook point and the menu-build point agree this closely, they describe
+bool g_hotkeyToggleList = false;
+void ShowHotkeySettings();// If the hook point and the menu-build point agree this closely, they describe
 // the same physical click and the hook (the true right-button-down) wins.
 constexpr LONG kAgreementTolerancePx = 64;
 
@@ -1302,6 +1304,7 @@ constexpr int kListIdNew = 101;
 constexpr int kListIdOpen = 102;
 constexpr int kListIdDelete = 103;
 constexpr int kListIdClose = 104;
+constexpr int kListIdSettings = 105;
 
 HWND g_list = nullptr;
 HWND g_listListbox = nullptr;
@@ -1351,6 +1354,7 @@ void LayoutNotesList() {
   const int y = listBottom + margin;
   HWND buttons[] = {GetDlgItem(g_list, kListIdNew),
                     GetDlgItem(g_list, kListIdOpen),
+                    GetDlgItem(g_list, kListIdSettings),
                     GetDlgItem(g_list, kListIdDelete)};
   for (HWND button : buttons) {
     if (!button) continue;
@@ -1413,6 +1417,7 @@ LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
       const ButtonSpec buttons[] = {
           {kListIdNew, L"新建"},
           {kListIdOpen, L"打开"},
+          {kListIdSettings, L"设置"},
           {kListIdDelete, L"删除"},
           {kListIdClose, L"关闭"},
       };
@@ -1444,6 +1449,10 @@ LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
       }
       if (id == kListIdOpen) {
         OpenSelectedNote();
+        return 0;
+      }
+      if (id == kListIdSettings) {
+        ShowHotkeySettings();
         return 0;
       }
       if (id == kListIdDelete) {
@@ -1493,7 +1502,7 @@ void EnsureListWindow() {
   }
   const UINT dpi = DpiForPoint({0, 0});
   RECT work = WorkAreaForPoint({0, 0});
-  const int width = ScaleFor(dpi, 420);
+  const int width = ScaleFor(dpi, 520);
   const int height = ScaleFor(dpi, 440);
   g_list = CreateWindowExW(
       WS_EX_TOOLWINDOW, kListClass, L"便签列表",
@@ -1521,6 +1530,465 @@ void ToggleNotesList() {
   }
 }
 
+// ------------------------------------------------------------- hotkey setup
+//
+// Both shortcuts are configurable. A new chord is only accepted after it
+// actually registers, so a combination already owned by another program is
+// reported instead of silently doing nothing.
+
+struct HotkeySpec {
+  UINT modifiers = 0;
+  UINT virtualKey = 0;
+};
+
+constexpr int kSettingsIdSave = 200;
+constexpr int kSettingsIdCancel = 201;
+
+HotkeySpec g_specNewNote = {MOD_CONTROL | MOD_ALT, 'N'};
+HotkeySpec g_specList = {MOD_CONTROL | MOD_ALT, 'L'};
+
+HWND g_settings = nullptr;
+HFONT g_settingsFont = nullptr;
+int g_armedSlot = -1;  // 0 = new note, 1 = list, -1 = nothing armed
+
+std::wstring HotkeySettingsPath() {
+  return StoreDirectory() + L"\\settings.ini";
+}
+
+std::wstring KeyDisplayName(UINT virtualKey) {
+  if (virtualKey == 0) return L"未设置";
+  const UINT scancode = MapVirtualKeyW(virtualKey, MAPVK_VK_TO_VSC);
+  wchar_t name[64] = {};
+  if (GetKeyNameTextW(static_cast<LONG>(scancode) << 16, name,
+                      static_cast<int>(_countof(name))) > 0 &&
+      name[0] != L'\0') {
+    return name;
+  }
+  wchar_t fallback[8] = {};
+  _snwprintf_s(fallback, _countof(fallback), _TRUNCATE, L"%c",
+               static_cast<wchar_t>(virtualKey));
+  return fallback;
+}
+
+std::wstring FormatHotkey(const HotkeySpec& spec) {
+  if (spec.virtualKey == 0) return L"未设置";
+  std::wstring text;
+  if (spec.modifiers & MOD_CONTROL) text += L"Ctrl + ";
+  if (spec.modifiers & MOD_ALT) text += L"Alt + ";
+  if (spec.modifiers & MOD_SHIFT) text += L"Shift + ";
+  if (spec.modifiers & MOD_WIN) text += L"Win + ";
+  text += KeyDisplayName(spec.virtualKey);
+  return text;
+}
+
+UINT CurrentModifiers() {
+  UINT modifiers = 0;
+  if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
+  if (GetKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
+  if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
+  if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) {
+    modifiers |= MOD_WIN;
+  }
+  return modifiers;
+}
+
+void LoadHotkeySettings() {
+  std::string bytes;
+  if (!ReadAllBytes(HotkeySettingsPath(), &bytes)) return;
+  const std::wstring text = ToWide(bytes);
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = text.find(L'\n', start);
+    if (end == std::wstring::npos) end = text.size();
+    std::wstring line = text.substr(start, end - start);
+    while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) {
+      line.pop_back();
+    }
+    const size_t equals = line.find(L'=');
+    if (equals != std::wstring::npos) {
+      const std::wstring key = line.substr(0, equals);
+      const int value = ParseInt(ToUtf8(line.substr(equals + 1)));
+      if (key == L"new_mods") {
+        g_specNewNote.modifiers = static_cast<UINT>(value);
+      } else if (key == L"new_vk") {
+        g_specNewNote.virtualKey = static_cast<UINT>(value);
+      } else if (key == L"list_mods") {
+        g_specList.modifiers = static_cast<UINT>(value);
+      } else if (key == L"list_vk") {
+        g_specList.virtualKey = static_cast<UINT>(value);
+      }
+    }
+    if (end == text.size()) break;
+    start = end + 1;
+  }
+  LogLine(L"hotkey settings loaded: new=%s list=%s",
+          FormatHotkey(g_specNewNote).c_str(),
+          FormatHotkey(g_specList).c_str());
+}
+
+void SaveHotkeySettings() {
+  wchar_t buffer[256] = {};
+  _snwprintf_s(buffer, _countof(buffer), _TRUNCATE,
+               L"new_mods=%u\nnew_vk=%u\nlist_mods=%u\nlist_vk=%u\n",
+               g_specNewNote.modifiers, g_specNewNote.virtualKey,
+               g_specList.modifiers, g_specList.virtualKey);
+  WriteAllBytes(HotkeySettingsPath(), ToUtf8(buffer));
+}
+
+// Unregisters the current pair, then registers the requested one. On failure the
+// previous pair is restored, so the user never loses a working shortcut.
+bool ApplyHotkeys(const HotkeySpec& forNew, const HotkeySpec& forList,
+                  std::wstring* error) {
+  if (forNew.virtualKey == 0 || forList.virtualKey == 0) {
+    if (error) *error = L"两个快捷键都必须设置。";
+    return false;
+  }
+  if (forNew.virtualKey == forList.virtualKey &&
+      forNew.modifiers == forList.modifiers) {
+    if (error) *error = L"两个快捷键不能相同。";
+    return false;
+  }
+
+  if (g_hotkeyNewNote) {
+    UnregisterHotKey(g_hidden, kHotkeyNewNote);
+    g_hotkeyNewNote = false;
+  }
+  if (g_hotkeyToggleList) {
+    UnregisterHotKey(g_hidden, kHotkeyToggleList);
+    g_hotkeyToggleList = false;
+  }
+
+  g_hotkeyNewNote =
+      RegisterHotKey(g_hidden, kHotkeyNewNote, forNew.modifiers | MOD_NOREPEAT,
+                     forNew.virtualKey) != FALSE;
+  g_hotkeyToggleList =
+      RegisterHotKey(g_hidden, kHotkeyToggleList,
+                     forList.modifiers | MOD_NOREPEAT,
+                     forList.virtualKey) != FALSE;
+
+  if (!g_hotkeyNewNote || !g_hotkeyToggleList) {
+    if (error) {
+      *error = !g_hotkeyNewNote
+                   ? (L"“" + FormatHotkey(forNew) +
+                      L"”已被其他程序占用，请换一个组合。")
+                   : (L"“" + FormatHotkey(forList) +
+                      L"”已被其他程序占用，请换一个组合。");
+    }
+    // Roll back to the last known-good pair.
+    if (g_hotkeyNewNote) {
+      UnregisterHotKey(g_hidden, kHotkeyNewNote);
+      g_hotkeyNewNote = false;
+    }
+    if (g_hotkeyToggleList) {
+      UnregisterHotKey(g_hidden, kHotkeyToggleList);
+      g_hotkeyToggleList = false;
+    }
+    g_hotkeyNewNote =
+        RegisterHotKey(g_hidden, kHotkeyNewNote,
+                       g_specNewNote.modifiers | MOD_NOREPEAT,
+                       g_specNewNote.virtualKey) != FALSE;
+    g_hotkeyToggleList =
+        RegisterHotKey(g_hidden, kHotkeyToggleList,
+                       g_specList.modifiers | MOD_NOREPEAT,
+                       g_specList.virtualKey) != FALSE;
+    return false;
+  }
+
+  g_specNewNote = forNew;
+  g_specList = forList;
+  SaveHotkeySettings();
+  LogLine(L"hotkeys applied: new=%s list=%s",
+          FormatHotkey(g_specNewNote).c_str(),
+          FormatHotkey(g_specList).c_str());
+  return true;
+}
+
+void SettingsBoxRects(HWND hwnd, RECT* boxNew, RECT* boxList, RECT* saveRect,
+                      RECT* cancelRect) {
+  RECT client = {};
+  GetClientRect(hwnd, &client);
+  const UINT dpi = GetDpiForWindow(hwnd);
+  const int margin = ScaleFor(dpi, 18);
+  const int rowGap = ScaleFor(dpi, 46);
+  const int labelWidth = ScaleFor(dpi, 118);
+  const int boxHeight = ScaleFor(dpi, 32);
+
+  boxNew->left = margin + labelWidth;
+  boxNew->top = margin + ScaleFor(dpi, 6);
+  boxNew->right = client.right - margin;
+  boxNew->bottom = boxNew->top + boxHeight;
+
+  boxList->left = boxNew->left;
+  boxList->top = boxNew->top + rowGap;
+  boxList->right = boxNew->right;
+  boxList->bottom = boxList->top + boxHeight;
+
+  const int buttonWidth = ScaleFor(dpi, 84);
+  const int buttonHeight = ScaleFor(dpi, 30);
+  const int buttonTop = client.bottom - margin - buttonHeight;
+  cancelRect->right = client.right - margin;
+  cancelRect->left = cancelRect->right - buttonWidth;
+  cancelRect->top = buttonTop;
+  cancelRect->bottom = buttonTop + buttonHeight;
+  saveRect->right = cancelRect->left - ScaleFor(dpi, 10);
+  saveRect->left = saveRect->right - buttonWidth;
+  saveRect->top = buttonTop;
+  saveRect->bottom = buttonTop + buttonHeight;
+}
+
+void LayoutSettings(HWND hwnd) {
+  RECT boxNew = {};
+  RECT boxList = {};
+  RECT saveRect = {};
+  RECT cancelRect = {};
+  SettingsBoxRects(hwnd, &boxNew, &boxList, &saveRect, &cancelRect);
+  HWND save = GetDlgItem(hwnd, kSettingsIdSave);
+  HWND cancel = GetDlgItem(hwnd, kSettingsIdCancel);
+  if (save) {
+    MoveWindow(save, saveRect.left, saveRect.top,
+               saveRect.right - saveRect.left, saveRect.bottom - saveRect.top,
+               TRUE);
+  }
+  if (cancel) {
+    MoveWindow(cancel, cancelRect.left, cancelRect.top,
+               cancelRect.right - cancelRect.left,
+               cancelRect.bottom - cancelRect.top, TRUE);
+  }
+}
+
+void PaintSettings(HWND hwnd) {
+  PAINTSTRUCT ps = {};
+  HDC dc = BeginPaint(hwnd, &ps);
+  RECT client = {};
+  GetClientRect(hwnd, &client);
+  FillRect(dc, &client, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+  SetBkMode(dc, TRANSPARENT);
+
+  const UINT dpi = GetDpiForWindow(hwnd);
+  const int margin = ScaleFor(dpi, 18);
+
+  RECT boxNew = {};
+  RECT boxList = {};
+  RECT saveRect = {};
+  RECT cancelRect = {};
+  SettingsBoxRects(hwnd, &boxNew, &boxList, &saveRect, &cancelRect);
+  const RECT boxes[2] = {boxNew, boxList};
+  const wchar_t* labels[2] = {L"新建便签", L"显示/隐藏列表"};
+  const HotkeySpec specs[2] = {g_specNewNote, g_specList};
+
+  HGDIOBJ oldFont = SelectObject(dc, g_settingsFont);
+
+  for (int slot = 0; slot < 2; ++slot) {
+    RECT labelRect = {margin, boxes[slot].top,
+                      boxes[slot].left - ScaleFor(dpi, 8),
+                      boxes[slot].bottom};
+    SetTextColor(dc, RGB(30, 30, 30));
+    DrawTextW(dc, labels[slot], -1, &labelRect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    const bool armed = (g_armedSlot == slot);
+    HBRUSH fill =
+        CreateSolidBrush(armed ? RGB(255, 246, 214) : RGB(250, 250, 250));
+    HPEN pen = CreatePen(PS_SOLID, armed ? 2 : 1,
+                         armed ? RGB(214, 158, 46) : RGB(198, 198, 198));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, fill);
+    Rectangle(dc, boxes[slot].left, boxes[slot].top, boxes[slot].right,
+              boxes[slot].bottom);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(fill);
+
+    RECT textRect = boxes[slot];
+    textRect.left += ScaleFor(dpi, 10);
+    textRect.right -= ScaleFor(dpi, 10);
+    SetTextColor(dc, armed ? RGB(150, 96, 0) : RGB(40, 40, 40));
+    const std::wstring text =
+        armed ? std::wstring(L"请按下新的组合键…") : FormatHotkey(specs[slot]);
+    DrawTextW(dc, text.c_str(), -1, &textRect,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+  }
+
+  SetTextColor(dc, RGB(120, 120, 120));
+  RECT hint = {margin, boxList.bottom + ScaleFor(dpi, 14),
+               client.right - margin, saveRect.top - ScaleFor(dpi, 6)};
+  DrawTextW(dc, L"点击输入框后按下组合键即可修改；若组合被其他程序占用，保存时会提示。",
+            -1, &hint, DT_LEFT | DT_WORDBREAK);
+
+  const wchar_t* buttons[2] = {L"保存", L"取消"};
+  const RECT rects[2] = {saveRect, cancelRect};
+  for (int i = 0; i < 2; ++i) {
+    RECT push = rects[i];
+    DrawFrameControl(dc, &push, DFC_BUTTON, DFCS_BUTTONPUSH);
+    SetTextColor(dc, RGB(30, 30, 30));
+    RECT label = rects[i];
+    DrawTextW(dc, buttons[i], -1, &label,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+  }
+
+  SelectObject(dc, oldFont);
+  EndPaint(hwnd, &ps);
+}
+
+LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
+                                 LPARAM lparam) {
+  switch (message) {
+    case WM_CREATE: {
+      const UINT dpi = GetDpiForWindow(hwnd);
+      g_settingsFont = CreateFontW(
+          -MulDiv(10, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE,
+          FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+          DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+      struct ButtonSpec {
+        int id;
+        const wchar_t* text;
+      };
+      const ButtonSpec specs[] = {{kSettingsIdSave, L"保存"},
+                                  {kSettingsIdCancel, L"取消"}};
+      for (const ButtonSpec& spec : specs) {
+        HWND button = CreateWindowExW(
+            0, L"BUTTON", spec.text, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0,
+            0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(spec.id)), g_instance,
+            nullptr);
+        if (button && g_settingsFont) {
+          SendMessageW(button, WM_SETFONT,
+                       reinterpret_cast<WPARAM>(g_settingsFont), TRUE);
+        }
+      }
+      LayoutSettings(hwnd);
+      return 0;
+    }
+
+    case WM_SIZE:
+      LayoutSettings(hwnd);
+      return 0;
+
+    case WM_PAINT:
+      PaintSettings(hwnd);
+      return 0;
+
+    case WM_ERASEBKGND:
+      return 1;
+
+    case WM_LBUTTONUP: {
+      POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      RECT boxNew = {};
+      RECT boxList = {};
+      RECT saveRect = {};
+      RECT cancelRect = {};
+      SettingsBoxRects(hwnd, &boxNew, &boxList, &saveRect, &cancelRect);
+      if (PtInRect(&boxNew, pt)) {
+        g_armedSlot = 0;
+      } else if (PtInRect(&boxList, pt)) {
+        g_armedSlot = 1;
+      } else {
+        g_armedSlot = -1;
+      }
+      SetFocus(hwnd);
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+      if (g_armedSlot < 0) break;
+      const UINT key = static_cast<UINT>(wparam);
+      // Modifier keys only arm a chord; it completes on a normal key.
+      if (key == VK_CONTROL || key == VK_MENU || key == VK_SHIFT ||
+          key == VK_LWIN || key == VK_RWIN || key == VK_APPS ||
+          key == VK_ESCAPE) {
+        return 0;
+      }
+      HotkeySpec spec;
+      spec.modifiers = CurrentModifiers();
+      spec.virtualKey = key;
+      if (g_armedSlot == 0) {
+        g_specNewNote = spec;
+      } else {
+        g_specList = spec;
+      }
+      g_armedSlot = -1;
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+
+    case WM_COMMAND:
+      if (LOWORD(wparam) == kSettingsIdSave) {
+        std::wstring error;
+        if (!ApplyHotkeys(g_specNewNote, g_specList, &error)) {
+          MessageBoxW(hwnd, error.c_str(), L"快捷键不可用",
+                      MB_OK | MB_ICONWARNING);
+          return 0;
+        }
+        MessageBoxW(hwnd, L"快捷键已更新。", L"纸笺便签",
+                    MB_OK | MB_ICONINFORMATION);
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (LOWORD(wparam) == kSettingsIdCancel) {
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      break;
+
+    case WM_CLOSE:
+      DestroyWindow(hwnd);
+      return 0;
+
+    case WM_DESTROY:
+      if (g_settingsFont) {
+        DeleteObject(g_settingsFont);
+        g_settingsFont = nullptr;
+      }
+      g_settings = nullptr;
+      g_armedSlot = -1;
+      return 0;
+  }
+  return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+void ShowHotkeySettings() {
+  if (g_settings) {
+    SetForegroundWindow(g_settings);
+    return;
+  }
+  static bool registered = false;
+  if (!registered) {
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = SettingsWndProc;
+    wc.hInstance = g_instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = L"PaperNotes.SettingsWindow.v1";
+    RegisterClassExW(&wc);
+    registered = true;
+  }
+  const UINT dpi = DpiForPoint({0, 0});
+  RECT work = WorkAreaForPoint({0, 0});
+  const int width = ScaleFor(dpi, 430);
+  const int height = ScaleFor(dpi, 300);
+  g_settings = CreateWindowExW(
+      WS_EX_TOOLWINDOW, L"PaperNotes.SettingsWindow.v1", L"快捷键设置",
+      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+      work.left + (work.right - work.left - width) / 2,
+      work.top + (work.bottom - work.top - height) / 2, width, height, nullptr,
+      nullptr, g_instance, nullptr);
+  if (g_settings) {
+    ShowWindow(g_settings, SW_SHOW);
+    // A background process cannot take the foreground, so raise through
+    // HWND_TOPMOST and immediately drop back.
+    SetWindowPos(g_settings, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetWindowPos(g_settings, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetForegroundWindow(g_settings);
+  }
+}
+
 void ShowTrayMenu() {
   HMENU menu = CreatePopupMenu();
   if (!menu) return;
@@ -1544,6 +2012,7 @@ void ShowTrayMenu() {
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING | (count == 0 ? MF_GRAYED : 0), kTrayMenuList,
               L"全部显示");
+  AppendMenuW(menu, MF_STRING, kTrayMenuHotkeys, L"快捷键设置…");
   AppendMenuW(menu, MF_STRING, kTrayMenuOpenList, L"便签列表…");
   AppendMenuW(menu, MF_STRING, kTrayMenuExit, L"退出纸笺便签");
 
@@ -1559,6 +2028,7 @@ void ShowTrayMenu() {
     for (NoteState* note : g_notes) BubbleNoteToFront(note);
   }
   if (command == kTrayMenuOpenList) ShowNotesList();
+  if (command == kTrayMenuHotkeys) ShowHotkeySettings();
   if (command >= kTrayMenuFirstNote &&
       command < kTrayMenuFirstNote + count) {
     BubbleNoteToFront(g_notes[command - kTrayMenuFirstNote]);
@@ -1709,12 +2179,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   InstallMouseHook();
   // Ctrl+Alt+N new note, Ctrl+Alt+L show/hide the notes list. MOD_NOREPEAT
   // stops auto-repeat while the keys are held.
-  g_hotkeyNewNote =
-      RegisterHotKey(g_hidden, kHotkeyNewNote,
-                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'N') != FALSE;
-  g_hotkeyToggleList =
-      RegisterHotKey(g_hidden, kHotkeyToggleList,
-                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'L') != FALSE;
+  LoadHotkeySettings();
+  ApplyHotkeys(g_specNewNote, g_specList, nullptr);
   LogLine(L"hotkeys newNote=%d list=%d", g_hotkeyNewNote ? 1 : 0,
           g_hotkeyToggleList ? 1 : 0);
   LogLine(L"desktop station=%s desktop=%s",
