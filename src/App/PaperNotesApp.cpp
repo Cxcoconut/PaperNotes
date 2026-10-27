@@ -54,6 +54,33 @@ constexpr int kMinHeight = 190;
 constexpr int kCascadeStep = 26;
 constexpr int kMaxCascade = 14;
 
+// ---------------------------------------------------------------- palette
+//
+// Single source of truth for the paper look.  Values come from the "Notes &
+// Writing App" profile (warm ink + amber accent on cream), rounded to what GDI
+// renders cleanly.
+//
+//   ink   on paper : ~15:1  (body text)
+//   muted on paper : ~6:1   (secondary text, title)
+//   edge  on paper : decorative only, never carries meaning
+//
+// Every surface (note, list, settings) must use these, otherwise the windows
+// stop looking like one product.
+constexpr COLORREF kPaper = RGB(255, 251, 235);       // #FFFBEB
+constexpr COLORREF kPaperStrip = RGB(250, 240, 204);  // focused note header
+constexpr COLORREF kPaperStripIdle = RGB(245, 239, 217);
+constexpr COLORREF kPaperEdge = RGB(226, 214, 186);
+constexpr COLORREF kPaperHover = RGB(242, 231, 197);
+constexpr COLORREF kInk = RGB(58, 48, 34);
+constexpr COLORREF kInkMuted = RGB(122, 108, 86);
+constexpr COLORREF kAmber = RGB(217, 119, 6);  // #D97706
+constexpr COLORREF kDanger = RGB(178, 44, 36);
+
+// Buttons on the note header.
+constexpr int kNoteButtonDip = 28;   // visual + hit square, >= 32px at 150%
+constexpr int kNoteButtonGapDip = 4;
+constexpr int kNoteTextPadDip = 12;  // inner padding of the text area
+
 // How long an anchor stays usable.  The menu-build sample is taken while the
 // menu is being built, so it is always within a few seconds of the click.
 constexpr ULONGLONG kMaxAnchorAgeMs = 120 * 1000;
@@ -118,6 +145,7 @@ ClickState* g_click = nullptr;
 NOTIFYICONDATAW g_tray = {};
 bool g_trayAdded = false;
 HBRUSH g_editBrush = nullptr;
+HBRUSH g_listBrush = nullptr;
 
 // Last anchor actually used, so a repeated command never reuses the same
 // recorded click for two different notes.
@@ -149,6 +177,14 @@ struct NoteState {
   std::wstring lastSaved;   // content already on disk, to avoid redundant writes
   std::wstring initialText; // content supplied when the window is created
   bool dirty = false;
+
+  // Interaction state for the two header buttons. -1 = none, 0 = hide,
+  // 1 = delete.  Held as plain ints so the points stay separate: a hover and a
+  // press can disagree, and drawing needs both.
+  int hoverButton = -1;
+  int pressButton = -1;
+  bool trackingMouse = false;
+  bool active = false;  // window focused: tints the paper header
 };
 
 std::vector<NoteState*> g_notes;
@@ -807,6 +843,192 @@ void LayoutNote(NoteState* state) {
              client.bottom - layout.titleHeight - layout.edge, TRUE);
 }
 
+// Header button geometry. Both buttons share one square size so the glyphs
+// read as a control group; the square itself is the hit area, which is 42x42
+// physical pixels at 150% -- comfortably above a 32px pointer target.
+RECT NoteButtonRect(const NoteState* state, int which) {
+  RECT client = {};
+  GetClientRect(state->hwnd, &client);
+  const NoteLayout layout = LayoutFor(state->dpi);
+  const int size = ScaleFor(state->dpi, kNoteButtonDip);
+  const int gap = ScaleFor(state->dpi, kNoteButtonGapDip);
+  const int rightPad = ScaleFor(state->dpi, 8);
+  const int right = client.right - rightPad - (which == 1 ? 0 : size + gap);
+  const int top = (layout.titleHeight - size) / 2;
+  RECT rect = {right - size, top, right, top + size};
+  return rect;
+}
+
+// -1 = not over a button, 0 = hide, 1 = delete.
+int NoteButtonAt(const NoteState* state, POINT pt) {
+  for (int which = 0; which < 2; ++which) {
+    RECT rect = NoteButtonRect(state, which);
+    if (PtInRect(&rect, pt)) return which;
+  }
+  return -1;
+}
+
+// Inner padding for the text.  EM_SETMARGINS only does left/right, so the top
+// and bottom breathing room has to come from the formatting rectangle.
+void ApplyNoteTextRect(NoteState* state) {
+  if (!state || !state->edit) return;
+  RECT client = {};
+  GetClientRect(state->edit, &client);
+  const int pad = ScaleFor(state->dpi, kNoteTextPadDip);
+  RECT format = {pad, pad, client.right - pad, client.bottom - pad};
+  if (format.right <= format.left) format.right = format.left + 1;
+  if (format.bottom <= format.top) format.bottom = format.top + 1;
+  SendMessageW(state->edit, EM_SETRECT, 0,
+               reinterpret_cast<LPARAM>(&format));
+}
+
+// A classic scrollbar is heavy on a paper note and most notes are short, so
+// show it only when the wrapped text actually overflows.  EM_POSFROMCHAR past
+// the last character returns the y the next line would start at, which accounts
+// for wrapping and is what EM_GETLINECOUNT alone cannot tell us.
+void UpdateNoteScrollbar(NoteState* state) {
+  if (!state || !state->edit) return;
+
+  const int length = GetWindowTextLengthW(state->edit);
+
+  RECT client = {};
+  GetClientRect(state->edit, &client);
+
+  int lineHeight = 0;
+  HDC dc = GetDC(state->edit);
+  if (dc) {
+    TEXTMETRICW metrics = {};
+    HGDIOBJ previous = state->font ? SelectObject(dc, state->font) : nullptr;
+    GetTextMetricsW(dc, &metrics);
+    if (previous) SelectObject(dc, previous);
+    lineHeight = metrics.tmHeight + metrics.tmExternalLeading;
+  }
+
+  // Measure the text the way the edit itself lays it out.  EM_POSFROMCHAR was
+  // tried first and always returned -1 here, and EM_GETLINECOUNT only counts
+  // hard line breaks -- it misses wrapping, which is the common case for a note.
+  // DT_EDITCONTROL makes DrawText wrap and clip exactly like a multiline edit.
+  const int pad = ScaleFor(state->dpi, kNoteTextPadDip);
+  const int availableHeight = (client.bottom - pad * 2) > 0 ? client.bottom - pad * 2 : 1;
+  bool needed = false;
+  if (length > 0 && lineHeight > 0 && dc) {
+    if (length > 65536) {
+      needed = true;  // far beyond any plausible window; skip the measurement
+    } else {
+      std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+      GetWindowTextW(state->edit, text.data(), length + 1);
+      text.resize(static_cast<size_t>(length));
+      RECT calc = {0, 0, (client.right - pad * 2) > 0 ? client.right - pad * 2 : 1, 0};
+      HGDIOBJ previous = state->font ? SelectObject(dc, state->font) : nullptr;
+      DrawTextW(dc, text.c_str(), length, &calc,
+                DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS |
+                    DT_EDITCONTROL);
+      if (previous) SelectObject(dc, previous);
+      needed = calc.bottom > availableHeight;
+    }
+  }
+  if (dc) ReleaseDC(state->edit, dc);
+
+  const LONG_PTR style = GetWindowLongPtrW(state->edit, GWL_STYLE);
+  const bool has = (style & WS_VSCROLL) != 0;
+  if (needed == has) return;
+
+  SetWindowLongPtrW(state->edit, GWL_STYLE,
+                    needed ? (style | WS_VSCROLL) : (style & ~WS_VSCROLL));
+  // A style change alone does not make the edit re-measure itself.
+  SetWindowPos(state->edit, nullptr, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+  InvalidateRect(state->edit, nullptr, TRUE);
+}
+
+// Shared owner-draw for every BUTTON in the list and settings windows.  The
+// stock Win32 button renders as a raised grey box, which looks like a different
+// product next to the paper notes.
+void PaintPaperButton(const DRAWITEMSTRUCT* item) {
+  if (!item) return;
+  RECT rect = item->rcItem;
+  const bool disabled = (item->itemState & ODS_DISABLED) != 0;
+  const bool pressed = (item->itemState & ODS_SELECTED) != 0;
+
+  HBRUSH background = CreateSolidBrush(pressed ? kPaperEdge : kPaper);
+  FillRect(item->hDC, &rect, background);
+  DeleteObject(background);
+
+  HPEN pen = CreatePen(PS_SOLID, 1, disabled ? kPaperEdge : kInkMuted);
+  HGDIOBJ oldPen = SelectObject(item->hDC, pen);
+  HGDIOBJ oldBrush = SelectObject(item->hDC, GetStockObject(NULL_BRUSH));
+  RoundRect(item->hDC, rect.left, rect.top, rect.right, rect.bottom,
+            ScaleFor(96, 6), ScaleFor(96, 6));
+  SelectObject(item->hDC, oldBrush);
+  SelectObject(item->hDC, oldPen);
+  DeleteObject(pen);
+
+  wchar_t label[128] = {};
+  GetWindowTextW(item->hwndItem, label, _countof(label));
+
+  const int previousMode = SetBkMode(item->hDC, TRANSPARENT);
+  SetTextColor(item->hDC, disabled ? kInkMuted : kInk);
+  HFONT font = reinterpret_cast<HFONT>(
+      SendMessageW(item->hwndItem, WM_GETFONT, 0, 0));
+  HGDIOBJ oldFont = font ? SelectObject(item->hDC, font) : nullptr;
+  DrawTextW(item->hDC, label, -1, &rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  if (oldFont) SelectObject(item->hDC, oldFont);
+
+  // Keyboard focus must stay visible; a filled background alone does not say
+  // which button has it.
+  if ((item->itemState & ODS_FOCUS) != 0 && !disabled) {
+    RECT inner = rect;
+    InflateRect(&inner, -3, -3);
+    DrawFocusRect(item->hDC, &inner);
+  }
+  SetBkMode(item->hDC, previousMode);
+}
+
+void PaintNoteButton(HDC dc, const NoteState* state, int which) {
+  RECT rect = NoteButtonRect(state, which);
+  const bool hot = state->hoverButton == which;
+  const bool down = state->pressButton == which;
+
+  // Press and hover only change fill, never geometry, so nothing shifts.
+  if (hot || down) {
+    HBRUSH brush = CreateSolidBrush(down ? kPaperEdge : kPaperHover);
+    HGDIOBJ oldBrush = SelectObject(dc, brush);
+    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom,
+              ScaleFor(state->dpi, 6), ScaleFor(state->dpi, 6));
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(brush);
+  }
+
+  // Delete is the destructive one: warm it only on hover, otherwise the two
+  // buttons would compete for attention on a surface that is mostly text.
+  const COLORREF color = (which == 1 && hot) ? kDanger : kInkMuted;
+  const int stroke = ScaleFor(state->dpi, 1) < 1 ? 1 : ScaleFor(state->dpi, 1);
+  HPEN pen = CreatePen(PS_SOLID, stroke, color);
+  HGDIOBJ oldPen = SelectObject(dc, pen);
+
+  const int cx = (rect.left + rect.right) / 2;
+  const int cy = (rect.top + rect.bottom) / 2;
+  const int arm = ScaleFor(state->dpi, 5);
+
+  // Drawn as lines rather than a font glyph: guarantees identical stroke weight
+  // on both buttons and avoids depending on glyph coverage in YaHei.
+  if (which == 0) {
+    MoveToEx(dc, cx - arm, cy, nullptr);
+    LineTo(dc, cx + arm + 1, cy);
+  } else {
+    MoveToEx(dc, cx - arm, cy - arm, nullptr);
+    LineTo(dc, cx + arm + 1, cy + arm + 1);
+    MoveToEx(dc, cx + arm, cy - arm, nullptr);
+    LineTo(dc, cx - arm - 1, cy + arm + 1);
+  }
+
+  SelectObject(dc, oldPen);
+  DeleteObject(pen);
+}
+
 void PaintNote(NoteState* state) {
   HWND hwnd = state->hwnd;
   PAINTSTRUCT ps = {};
@@ -814,24 +1036,30 @@ void PaintNote(NoteState* state) {
   RECT client = {};
   GetClientRect(hwnd, &client);
 
-  const COLORREF paper = RGB(255, 249, 221);
-  const COLORREF strip = RGB(250, 232, 176);
-  const COLORREF border = RGB(204, 182, 128);
-  const COLORREF ink = RGB(74, 61, 42);
-
-  HBRUSH paperBrush = CreateSolidBrush(paper);
+  HBRUSH paperBrush = CreateSolidBrush(kPaper);
   FillRect(dc, &client, paperBrush);
   DeleteObject(paperBrush);
 
   const NoteLayout layout = LayoutFor(state->dpi);
 
+  // The header tints with focus so several notes can be told apart at a glance.
   RECT stripRect = {0, 0, client.right, layout.titleHeight};
-  HBRUSH stripBrush = CreateSolidBrush(strip);
+  HBRUSH stripBrush =
+      CreateSolidBrush(state->active ? kPaperStrip : kPaperStripIdle);
   FillRect(dc, &stripRect, stripBrush);
   DeleteObject(stripBrush);
 
-  HPEN borderPen = CreatePen(PS_SOLID, 1, border);
-  HGDIOBJ oldPen = SelectObject(dc, borderPen);
+  // Hairline instead of a hard rule: separates title from text without cutting
+  // the note in two.
+  HPEN hairline = CreatePen(PS_SOLID, 1, kPaperEdge);
+  HGDIOBJ oldPen = SelectObject(dc, hairline);
+  MoveToEx(dc, 0, layout.titleHeight - 1, nullptr);
+  LineTo(dc, client.right, layout.titleHeight - 1);
+  SelectObject(dc, oldPen);
+  DeleteObject(hairline);
+
+  HPEN borderPen = CreatePen(PS_SOLID, 1, kPaperEdge);
+  oldPen = SelectObject(dc, borderPen);
   HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
   Rectangle(dc, 0, 0, client.right, client.bottom);
   SelectObject(dc, oldBrush);
@@ -839,37 +1067,26 @@ void PaintNote(NoteState* state) {
   DeleteObject(borderPen);
 
   SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, ink);
+  SetTextColor(dc, kInkMuted);
   HFONT titleFont = CreateFontW(
-      -MulDiv(15, static_cast<int>(GetDpiForWindow(hwnd)), 72), 0, 0, 0,
+      -MulDiv(10, static_cast<int>(GetDpiForWindow(hwnd)), 72), 0, 0, 0,
       FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
       L"Microsoft YaHei UI");
   HGDIOBJ oldFont = SelectObject(dc, titleFont);
   RECT titleRect = {layout.edge, 0,
-                    client.right - layout.closeWidth - layout.deleteWidth -
-                        ScaleFor(state->dpi, 6),
+                    NoteButtonRect(state, 0).left - ScaleFor(state->dpi, 6),
                     layout.titleHeight};
-  DrawTextW(dc, L"便签", -1, &titleRect,
+  // Escapes rather than literals: the title must not depend on how the compiler
+  // decodes this file.
+  DrawTextW(dc, L"\u4FBF\u7B7E", -1, &titleRect,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-
-  // Left button: hide. The note is kept and stays reachable from the list.
-  SetTextColor(dc, ink);
-  RECT hideRect = {client.right - layout.closeWidth - layout.deleteWidth,
-                   layout.buttonTop, client.right - layout.closeWidth,
-                   layout.buttonBottom};
-  DrawTextW(dc, L"\u2212", -1, &hideRect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-  // Right button: delete. It is the only destructive action, so it confirms.
-  RECT deleteRect = {client.right - layout.closeWidth, layout.buttonTop,
-                     client.right - ScaleFor(state->dpi, 8),
-                     layout.buttonBottom};
-  DrawTextW(dc, L"\u00D7", -1, &deleteRect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
   SelectObject(dc, oldFont);
   DeleteObject(titleFont);
+
+  PaintNoteButton(dc, state, 0);  // hide
+  PaintNoteButton(dc, state, 1);  // delete
+
   EndPaint(hwnd, &ps);
 }
 
@@ -921,11 +1138,25 @@ LRESULT CALLBACK NoteWndProc(HWND hwnd, UINT message, WPARAM wparam,
         }
         ApplyRoundedCorners(hwnd);
         LayoutNote(state);
+        ApplyNoteTextRect(state);
+        UpdateNoteScrollbar(state);
       }
       return 0;
 
     case WM_SIZE:
       LayoutNote(state);
+      ApplyNoteTextRect(state);
+      UpdateNoteScrollbar(state);
+      return 0;
+
+    case WM_ACTIVATE:
+      if (state) {
+        const bool active = LOWORD(wparam) != WA_INACTIVE;
+        if (state->active != active) {
+          state->active = active;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+      }
       return 0;
 
     case WM_DPICHANGED:
@@ -958,10 +1189,91 @@ LRESULT CALLBACK NoteWndProc(HWND hwnd, UINT message, WPARAM wparam,
 
     case WM_CTLCOLOREDIT: {
       HDC dc = reinterpret_cast<HDC>(wparam);
-      SetTextColor(dc, RGB(74, 61, 42));
-      SetBkColor(dc, RGB(255, 249, 221));
-      if (!g_editBrush) g_editBrush = CreateSolidBrush(RGB(255, 249, 221));
+      SetTextColor(dc, kInk);
+      SetBkColor(dc, kPaper);
+      if (!g_editBrush) g_editBrush = CreateSolidBrush(kPaper);
       return reinterpret_cast<LRESULT>(g_editBrush);
+    }
+
+    // Hover feedback for the two header buttons. TrackMouseEvent is required or
+    // WM_MOUSELEAVE never arrives and a hovered button stays lit after exit.
+    case WM_MOUSEMOVE: {
+      if (state) {
+        POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        const int which = NoteButtonAt(state, pt);
+        if (which != state->hoverButton) {
+          state->hoverButton = which;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (!state->trackingMouse) {
+          TRACKMOUSEEVENT track = {};
+          track.cbSize = sizeof(track);
+          track.dwFlags = TME_LEAVE;
+          track.hwndTrack = hwnd;
+          TrackMouseEvent(&track);
+          state->trackingMouse = true;
+        }
+      }
+      return 0;
+    }
+
+    case WM_MOUSELEAVE:
+      if (state) {
+        state->trackingMouse = false;
+        if (state->hoverButton != -1 || state->pressButton != -1) {
+          state->hoverButton = -1;
+          state->pressButton = -1;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+      }
+      return 0;
+
+    case WM_SETCURSOR:
+      if (state && LOWORD(lparam) == HTCLIENT && state->hoverButton >= 0) {
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        return TRUE;
+      }
+      break;
+
+    case WM_LBUTTONDOWN: {
+      if (state) {
+        POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        const int which = NoteButtonAt(state, pt);
+        if (which >= 0) {
+          state->pressButton = which;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+      }
+      break;
+    }
+
+    case WM_LBUTTONUP: {
+      POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      const int which = state ? NoteButtonAt(state, pt) : -1;
+      if (state && (state->pressButton != -1 || which != -1)) {
+        state->pressButton = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+      }
+      if (which == 1) {
+        // Delete, with confirmation: it is the only destructive action.
+        if (MessageBoxW(hwnd,
+                        L"\u5220\u9664\u8FD9\u5F20\u4FBF\u7B7E\uFF1F\n\n"
+                        L"\u5220\u9664\u540E\u65E0\u6CD5\u6062\u590D\u3002",
+                        L"\u5220\u9664\u4FBF\u7B7E",
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+          if (state) DeleteNoteFile(state);
+          // WM_DESTROY unlinks the state from g_notes; do not do it here too.
+          DestroyWindow(hwnd);
+        }
+        return 0;
+      }
+      if (which == 0) {
+        // Hide. Content stays saved and the note stays in the list.
+        SaveNote(state, true);
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+      }
+      break;
     }
 
     case WM_NCHITTEST: {
@@ -980,37 +1292,12 @@ LRESULT CALLBACK NoteWndProc(HWND hwnd, UINT message, WPARAM wparam,
       return HTCLIENT;
     }
 
-    case WM_LBUTTONUP: {
-      POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-      RECT client = {};
-      GetClientRect(hwnd, &client);
-      const NoteLayout layout = LayoutFor(state ? state->dpi : 96);
-      if (pt.y >= 0 && pt.y <= layout.buttonBottom) {
-        if (pt.x >= client.right - layout.closeWidth) {
-          // Right button: delete, with confirmation.
-          if (MessageBoxW(hwnd,
-                          L"删除这张便签？\n\n删除后无法恢复。",
-                          L"删除便签",
-                          MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
-            if (state) DeleteNoteFile(state);
-            DestroyWindow(hwnd);
-          }
-          return 0;
-        }
-        if (pt.x >= client.right - layout.closeWidth - layout.deleteWidth) {
-          // Left button: hide. Content stays saved and listed.
-          SaveNote(state, true);
-          ShowWindow(hwnd, SW_HIDE);
-          return 0;
-        }
-      }
-      break;
-    }
-
     case WM_COMMAND:
       if (state && HIWORD(wparam) == EN_CHANGE &&
           reinterpret_cast<HWND>(lparam) == state->edit) {
         state->dirty = true;
+        // The scrollbar appears as soon as the text outgrows the window.
+        UpdateNoteScrollbar(state);
         // Debounce: typing must never touch the disk per keystroke.
         SetTimer(hwnd, 2, 600, nullptr);
         return 0;
@@ -1400,7 +1687,7 @@ LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
           DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 
       g_listListbox = CreateWindowExW(
-          WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+          0, L"LISTBOX", L"",
           WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY |
               LBS_NOINTEGRALHEIGHT,
           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListIdListbox)),
@@ -1424,7 +1711,7 @@ LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
       for (const ButtonSpec& spec : buttons) {
         HWND button = CreateWindowExW(
             0, L"BUTTON", spec.text,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0,
             hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(spec.id)), g_instance, nullptr);
         if (button && g_listFont) {
           SendMessageW(button, WM_SETFONT,
@@ -1439,6 +1726,31 @@ LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
     case WM_SIZE:
       LayoutNotesList();
       return 0;
+
+    // Paper background for the whole dialog, and owner-drawn buttons to match.
+    case WM_ERASEBKGND: {
+      HDC dc = reinterpret_cast<HDC>(wparam);
+      RECT client = {};
+      GetClientRect(hwnd, &client);
+      HBRUSH brush = CreateSolidBrush(kPaper);
+      FillRect(dc, &client, brush);
+      DeleteObject(brush);
+      return 1;
+    }
+
+    case WM_DRAWITEM:
+      PaintPaperButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lparam));
+      return TRUE;
+
+    // The listbox is a native control; without this it stays white and looks
+    // pasted on top of the paper background.
+    case WM_CTLCOLORLISTBOX: {
+      HDC dc = reinterpret_cast<HDC>(wparam);
+      SetTextColor(dc, kInk);
+      SetBkColor(dc, kPaper);
+      if (!g_listBrush) g_listBrush = CreateSolidBrush(kPaper);
+      return reinterpret_cast<LRESULT>(g_listBrush);
+    }
 
     case WM_COMMAND: {
       const int id = LOWORD(wparam);
@@ -1762,6 +2074,9 @@ void PaintSettings(HWND hwnd) {
   RECT client = {};
   GetClientRect(hwnd, &client);
   FillRect(dc, &client, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+  HBRUSH paper = CreateSolidBrush(kPaper);
+  FillRect(dc, &client, paper);
+  DeleteObject(paper);
   SetBkMode(dc, TRANSPARENT);
 
   const UINT dpi = GetDpiForWindow(hwnd);
@@ -1782,15 +2097,13 @@ void PaintSettings(HWND hwnd) {
     RECT labelRect = {margin, boxes[slot].top,
                       boxes[slot].left - ScaleFor(dpi, 8),
                       boxes[slot].bottom};
-    SetTextColor(dc, RGB(30, 30, 30));
+    SetTextColor(dc, kInk);
     DrawTextW(dc, labels[slot], -1, &labelRect,
               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     const bool armed = (g_armedSlot == slot);
-    HBRUSH fill =
-        CreateSolidBrush(armed ? RGB(255, 246, 214) : RGB(250, 250, 250));
-    HPEN pen = CreatePen(PS_SOLID, armed ? 2 : 1,
-                         armed ? RGB(214, 158, 46) : RGB(198, 198, 198));
+    HBRUSH fill = CreateSolidBrush(armed ? kPaperStrip : kPaper);
+    HPEN pen = CreatePen(PS_SOLID, armed ? 2 : 1, armed ? kAmber : kPaperEdge);
     HGDIOBJ oldPen = SelectObject(dc, pen);
     HGDIOBJ oldBrush = SelectObject(dc, fill);
     Rectangle(dc, boxes[slot].left, boxes[slot].top, boxes[slot].right,
@@ -1849,8 +2162,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
                                   {kSettingsIdCancel, L"取消"}};
       for (const ButtonSpec& spec : specs) {
         HWND button = CreateWindowExW(
-            0, L"BUTTON", spec.text, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0,
-            0, 0, hwnd,
+            0, L"BUTTON", spec.text,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0,
+            hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(spec.id)), g_instance,
             nullptr);
         if (button && g_settingsFont) {
@@ -1872,6 +2186,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
 
     case WM_ERASEBKGND:
       return 1;
+
+    case WM_DRAWITEM:
+      PaintPaperButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lparam));
+      return TRUE;
 
     case WM_LBUTTONUP: {
       POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
