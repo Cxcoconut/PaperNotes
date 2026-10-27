@@ -2142,6 +2142,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   ProbeWritableLocation(LocalAppDataDirectory());
 
   const bool wantsNewNote = HasArgument(L"--new-note");
+  // Started from HKCU\...\Run. Signing in must be silent: restore the notes
+  // hidden and pop nothing, not even the fallback list window.
+  const bool isAutostart = HasArgument(L"--autostart");
 
   HANDLE mutex =
       CreateMutexW(nullptr, FALSE, L"Local\\PaperNotes.SingleInstance.v1");
@@ -2186,16 +2189,19 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   LogLine(L"desktop station=%s desktop=%s",
           UserObjectName(GetProcessWindowStation()).c_str(),
           UserObjectName(GetThreadDesktop(GetCurrentThreadId())).c_str());
-  LogLine(L"phase0 app started; pid=%lu wantsNewNote=%d mapping=%d",
-          GetCurrentProcessId(), wantsNewNote ? 1 : 0, g_click ? 1 : 0);
+  LogLine(L"phase0 app started; pid=%lu wantsNewNote=%d autostart=%d mapping=%d",
+          GetCurrentProcessId(), wantsNewNote ? 1 : 0, isAutostart ? 1 : 0,
+          g_click ? 1 : 0);
   SetTimer(g_hidden, 1, 5000, nullptr);
 
   // Notes come back as hidden windows so launching never scatters the desktop.
   RestoreStoredNotes();
 
   // Without a tray icon there would be no way back to those hidden notes, so
-  // surface the list instead of stranding them.
-  if (!g_trayAdded && !wantsNewNote) {
+  // surface the list instead of stranding them -- except at sign-in, where
+  // opening a window nobody asked for would be worse than staying silent.
+  // Ctrl+Alt+L and the shell menu still reach the notes.
+  if (!g_trayAdded && !wantsNewNote && !isAutostart) {
     LogLine(L"tray icon unavailable; opening notes list as the fallback entry");
     ShowNotesList();
   }
