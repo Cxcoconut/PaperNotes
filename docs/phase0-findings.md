@@ -134,6 +134,62 @@ QueryContextMenu hr=0x0000004A items=10
 
 每次记录的 tick 只被消费一次，避免连续新建时复用同一个点。
 
+## 4.5 `ExplorerCommandHandler` 能否替代 MSIX（2026-10-27 实测，结论：**不能**）
+
+原计划（旧交接文档 §9 第 3 项）设想：在 `DesktopBackground\shell\<verb>` 下设
+`ExplorerCommandHandler` = CLSID，若能在 Win11 第一层菜单出现，就能去掉 MSIX，
+免代码签名、免开发者模式。**实测否定了这个设想。**
+
+### 为什么当初看起来很有希望
+
+本机 `HKLM\Software\Classes\DesktopBackground\shell` 下确有系统自带动词用这条通道，
+且 `InprocServer32` 指向普通 DLL（非打包 COM）：
+
+```
+.SpotlightLearnMore  ExplorerCommandHandler={5C6B744C-...}  -> C:\Windows\System32\shell32.dll
+EditStickers         ExplorerCommandHandler={3C0E1E28-...}  -> C:\Windows\System32\themecpl.dll
+```
+
+它们也确实出现在现代第一层菜单（截图里「浏览背景」「下一个背景」）。
+
+### 但换成"每用户 + 自建未签名 DLL"就不行
+
+受控对照实验（每步都用真实桌面右键 + 截图验证，DeskGo 已退出）：
+
+| 步骤 | MSIX 包 | ECH 动词 | shellex 处理器 | 桌面现代第一层是否出现 |
+|---|---|---|---|---|
+| A | 移除 | 无 | 有 | **不出现** |
+| B | 移除 | 无 | 有 | **不出现**（资源管理器文件夹背景同样不出现）|
+| C | 移除 | **有** | 有 | **不出现**（资源管理器文件夹背景同样不出现）|
+| D | 恢复 | 无 | 有 | **出现**（恢复原状后确认）|
+
+证据：`out/diagnostics/ech-test-{A,B,C}-*.png`。
+
+### 排除性验证：注册本身是有效的
+
+`probe-shell-menu.ps1` 在步骤 C 下枚举出**两条**「新建便签」：
+
+```
+[1] 新建便签   <- shellex 处理器（0A12）
+[3] 新建便签   <- ExplorerCommandHandler 动词（0A11）
+```
+
+说明 `ExplorerCommandHandler` 注册被系统正确识别并进入了**经典**菜单，
+只是**现代第一层菜单不渲染它**。
+
+### 结论与教训
+
+1. 系统自带的 `.SpotlightLearnMore` 能进现代菜单，原因不是 `ExplorerCommandHandler` 本身，
+   而是它属于**系统组件**（shell32/themecpl，受信任）。**不能据此推断第三方未签名 DLL 同样可行。**
+2. 本项目要进 Win11 现代第一层菜单，**MSIX（`IExplorerCommand` + `com:SurrogateServer`）仍是必需路径**。
+3. 若同时保留 ECH 动词与 shellex 处理器，**「显示更多选项」里会出现两条重复项**——
+   这是实际观察到的副作用，不要两个都注册。
+4. 旧文档里「ECH 可替代 MSIX、交付成本大降」的乐观判断**已作废**，不要再按它排期。
+
+> 方法论提醒：本实验一开始因为 MSIX 包被自动重新注册而得出过相反结论
+> （误以为 shellex 处理器单独就能进现代菜单）。**做注册表对照实验前必须先确认
+> `Get-AppxPackage` 状态**，否则 MSIX 会冒充 shellex 的功劳。
+
 ## 5. 已修复的缺陷（含根因）
 
 | 缺陷 | 根因 | 修复 |
