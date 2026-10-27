@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+    xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+    xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+    IgnorableNamespaces="uap uap10 rescap desktop4 desktop5 com">
+
+  <Identity
+      Name="PaperNotes.Phase0"
+      Publisher="CN=PaperNotesDev"
+      Version="0.1.0.0"
+      ProcessorArchitecture="x64"/>
+
+  <Properties>
+    <DisplayName>纸笺便签（阶段 0 验证）</DisplayName>
+    <PublisherDisplayName>PaperNotes</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily
+        Name="Windows.Desktop"
+        MinVersion="10.0.19041.0"
+        MaxVersionTested="10.0.26200.0"/>
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="zh-CN"/>
+    <Resource Language="en-US"/>
+  </Resources>
+
+  <Applications>
+    <Application
+        Id="App"
+        Executable="PaperNotes.exe"
+        uap10:TrustLevel="mediumIL"
+        uap10:RuntimeBehavior="win32App">
+
+      <uap:VisualElements
+          DisplayName="纸笺便签"
+          Description="在桌面右键处新建轻量便签"
+          BackgroundColor="#FFF8DC"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png"/>
+
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="PaperNotes Shell Command">
+              <com:Class
+                  Id="3b1a6c2e-6f41-4a1c-9d3a-7e5b2c8f0a11"
+                  Path="PaperNotes.Shell.dll"
+                  ThreadingModel="STA"/>
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="Directory\Background">
+              <desktop5:Verb
+                  Id="PaperNotesNewNote"
+                  Clsid="3b1a6c2e-6f41-4a1c-9d3a-7e5b2c8f0a11"/>
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust"/>
+  </Capabilities>
+</Package>

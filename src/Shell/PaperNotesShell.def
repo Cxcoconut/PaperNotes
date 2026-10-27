@@ -1,0 +1,4 @@
+LIBRARY PaperNotes.Shell.dll
+EXPORTS
+  DllGetClassObject PRIVATE
+  DllCanUnloadNow PRIVATE
