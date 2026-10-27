@@ -88,14 +88,49 @@ function Find-SdkTool([string]$name) {
 
 function Install-Files {
   Step "安装文件 -> $InstallDir"
-  if ($DryRun) { Say "  [dry] 复制 PaperNotes.exe 与 $dllName"; return }
+  if ($DryRun) { Say "  [dry] 先停止运行中的 PaperNotes，再复制 PaperNotes.exe 与 $dllName"; return }
+
+  # Must stop first: reinstalling over a running instance fails with
+  # "file is in use" on PaperNotes.exe.  The first upgrade only worked because
+  # the process happened to be stopped already.
+  $running = Get-Process PaperNotes -ErrorAction SilentlyContinue
+  if ($running) {
+    Say "  停止运行中的 PaperNotes (pid=$($running.Id -join ','))"
+    $running | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 900
+    $still = Get-Process PaperNotes -ErrorAction SilentlyContinue
+    if ($still) {
+      throw "无法停止 PaperNotes（可能以管理员身份运行）：请手动结束进程后重试"
+    }
+  }
 
   New-Item -ItemType Directory -Force $InstallDir | Out-Null
-  Copy-Item (Join-Path $bin 'PaperNotes.exe') $InstallDir -Force
+  try {
+    Copy-Item (Join-Path $bin 'PaperNotes.exe') $InstallDir -Force -ErrorAction Stop
+  } catch {
+    throw "复制 PaperNotes.exe 失败：$($_.Exception.Message)。请先结束 PaperNotes 进程后重试"
+  }
   # 带版本号，见文件头注释
   Copy-Item (Join-Path $bin 'PaperNotes.Shell.dll') (Join-Path $InstallDir $dllName) -Force
   Say "  PaperNotes.exe"
   Say "  $dllName"
+
+  # Versioned DLL names mean an upgrade leaves the previous file behind.  Drop
+  # the superseded copies, but never fail the install over it: Explorer may still
+  # have one loaded, and the registration already points at the new file.
+  Get-ChildItem $InstallDir -Filter 'PaperNotes.Shell.*.dll' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne $dllName } |
+    ForEach-Object {
+      # Keep the file in its own variable: inside catch, $_ is the error record,
+      # so $_.Name would print empty.
+      $stale = $_
+      try {
+        Remove-Item $stale.FullName -Force -ErrorAction Stop
+        Say "  清理旧版本 $($stale.Name)"
+      } catch {
+        Say "  旧版本 $($stale.Name) 正被占用，保留（不影响使用）"
+      }
+    }
 }
 
 function Ensure-SigningCert {

@@ -45,12 +45,16 @@ constexpr UINT kTrayMenuHotkeys = 1005;
 // Note entries occupy a contiguous command-id range above the fixed commands.
 constexpr UINT kTrayMenuFirstNote = 2000;
 
-constexpr int kInitialWidth = 340;
-constexpr int kInitialHeight = 270;
-constexpr int kTitleHeight = 44;
+// Sizes are device-independent pixels.  A note is deliberately small: it sits
+// on top of real work, so it must not hide much of the screen.  310x245 keeps a
+// usable writing area while giving roughly a tenth of the screen back compared
+// with the original 340x270.
+constexpr int kInitialWidth = 310;
+constexpr int kInitialHeight = 245;
+constexpr int kTitleHeight = 40;
 constexpr int kEdge = 14;
-constexpr int kMinWidth = 260;
-constexpr int kMinHeight = 190;
+constexpr int kMinWidth = 250;
+constexpr int kMinHeight = 180;
 constexpr int kCascadeStep = 26;
 constexpr int kMaxCascade = 14;
 
@@ -1814,8 +1818,8 @@ void EnsureListWindow() {
   }
   const UINT dpi = DpiForPoint({0, 0});
   RECT work = WorkAreaForPoint({0, 0});
-  const int width = ScaleFor(dpi, 520);
-  const int height = ScaleFor(dpi, 440);
+  const int width = ScaleFor(dpi, 470);
+  const int height = ScaleFor(dpi, 400);
   g_list = CreateWindowExW(
       WS_EX_TOOLWINDOW, kListClass, L"便签列表",
       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX,
