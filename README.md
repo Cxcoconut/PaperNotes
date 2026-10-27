@@ -399,7 +399,13 @@ Wintrust.dll / WinVerifyTrust
 - 注册表菜单标签写入后要**回读字节**校验（`新建便签` = `65B0 5EFA 4FBF 7B7E`）。
 - 便签 `×` 走 `WM_CLOSE` → `SaveNote(force=true)` + `SW_HIDE`，**会顺带把空便签也落盘**；
   清理测试残留时要同时删窗口和 `.note` 文件。
+- **不要用 `GetWindowText` 读便签正文来判断"空不空"**：本会话对隐藏的便签窗口读到长度 0，
+  但对应 `.note` 文件里确实有 14 个字的正文（差点因此误删用户数据）。
+  **判断内容一律读 `.note` 文件**（并按 UTF-8 读）。
+- `out\` 被 gitignore，所以放在里面的证据截图**不会入库**；要留证据得复制到 `docs/evidence\`。
 - 此环境下 `Start-Process` 可能挂住 executor；用 `[System.Diagnostics.Process]::Start($psi)` 更稳。
+- 新写的 PowerShell 脚本**含中文字面量时必须带 UTF-8 BOM**，否则 5.1 按 ANSI 解析，
+  报一堆莫名其妙的语法错误（§7.3）。`write` 类工具默认不写 BOM，写完要自己补。
 
 ---
 
