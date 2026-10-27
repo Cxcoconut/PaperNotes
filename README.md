@@ -10,11 +10,14 @@
 
 ## 1. 一句话现状
 
-Windows 11 桌面右键第一层菜单的「新建便签」**已跑通**（现代菜单 + 腾讯桌面整理共存两种环境都验证过），
-便签本体具备多张、自动保存、重启恢复（不铺开）、列表找回、可配置全局快捷键。
+Windows 11 桌面右键第一层菜单的「新建便签」**已跑通并已可正式安装**
+（现代菜单 + 腾讯桌面整理共存两种环境都验证过），
+便签本体具备多张、自动保存、重启恢复（不铺开）、列表找回、可配置全局快捷键、开机自启。
 
-**尚未完成**：开机自启、安装程序、阶段 2 验收与交付。
-**最大的交付障碍**：现代第一层菜单依赖未签名 MSIX，普通用户装不了（见 §9）。
+安装程序 `tools\install.ps1` 已端到端验证：提权安装签名 MSIX + 经典菜单处理器 + 自启，
+安装后桌面现代第一层菜单确认出现「新建便签」。
+
+**尚未完成**：UI 打磨（含设置窗口外观待确认）、升级/卸载循环实测、阶段 2 验收。
 
 ---
 
@@ -53,8 +56,8 @@ Windows 11 桌面右键第一层菜单的「新建便签」**已跑通**（现�
 | DPI 缩放（150% 下不被字撑爆） | 完成 | 便签 510×405 物理像素 |
 | 验证 `ExplorerCommandHandler` 能否替代 MSIX | **完成，结论：不能** | §4.2 / `docs/phase0-findings.md` §4.5 |
 | 开机自启（`--autostart` 静默启动） | **完成** | §4.8，`tools/register-autostart.ps1` |
-| MSIX 签名可行性（自签名 vs 购买证书） | **完成，结论见 §4.9** | 实测 `0x800B0109` |
-| 安装程序（安装/注册/自启/卸载保留数据） | **未做**（待定分发方式，见 §9） | |
+| MSIX 签名可行性（自签名 vs 购买证书） | **完成，结论见 §4.9** | 实测 `SignatureKind=Developer` |
+| 安装程序（安装/注册/自启/卸载保留数据） | **完成** | §4.10，`tools/install.ps1` |
 | Windows 10 实测 | **不做**（用户决定） | |
 | 阶段 2 验收、性能指标、交付物 | **未做** | |
 
@@ -210,22 +213,62 @@ HRESULT: 0x800B0109
 （`LocalMachine\Root` / `LocalMachine\TrustedPeople`），不认当前用户存储。
 所以 `signtool verify`（用用户存储）通过 ≠ 安装会通过，两者结论会打架。
 
-**本机限制**：无管理员权限，写 `LocalMachine\Root` 直接 `ERROR_ACCESS_DENIED(5)`，
-因此**无法在本机完成签名包安装验证**。
+**关键转机：证书进 `LocalMachine\Root` 之后就能装了。**
+
+提权把证书导入机器级存储后，同一台机器、同一个包，`Add-AppxPackage` **成功**：
+
+```
+PaperNotes.Phase0_0.1.0.0_x64__gzfq254d1nysy
+SignatureKind=Developer  Status=Ok
+```
+
+这同时证明了一件重要的事：**之前那次失败时开发者模式是开着的**，
+所以开发者模式并不能绕过证书信任要求——**决定成败的是机器级证书信任，不是开发者模式**。
 
 **三条分发路径及其真实代价**：
 
 | 路径 | 目标机器要求 | 成本 | 适用 |
 |---|---|---|---|
 | 公开 CA 证书（OV/EV）签 MSIX | **无**（公共根已在机器存储里） | 买证书 + 资质审核 | 公开发布 |
-| 自签名 + 安装程序**提权**写 `LocalMachine\Root` | 每台机器 UAC 一次 | 免费 | 自己/小范围 |
+| 自签名 + 安装程序**提权**写 `LocalMachine\Root` | 每台机器 UAC 一次 | 免费 | 自己/小范围 ← **当前采用** |
 | 保持现状：开发者模式松散注册 | 每台机器开**开发者模式** | 免费 | 仅开发机 |
 
-**重要**：用户已明确「可接受管理员权限」，所以第二条路在需求上是允许的；
-它只是需要安装程序**提权**，这决定了安装程序的形态（见 §9）。
+**重要**：用户已明确「可接受管理员权限」，所以第二条路在需求上是允许的，
+`tools\install.ps1` 已按它实现并**端到端验证通过**（见 §4.10）。
 
 > 误导性提醒：`signtool verify` 成功不能证明 MSIX 可安装。
 > 判断标准只能是 `Add-AppxPackage` 本身，且必须在**目标机器**上验证。
+>
+> 另一个坑：签名包安装成功后 `SignatureKind` 是 `Developer`（自签名特征），
+> 这不是错误状态，也不代表还需要开发者模式。
+
+### 4.10 安装程序（`tools/install.ps1`）
+
+已端到端跑通。流程：**提权 → 落安装目录 → 证书进机器级存储 → 打包签名 → 装 MSIX →
+清 HKCU 残留 → 注册 HKLM 经典处理器 → 配自启 → 保存状态 → 降权启动**。
+
+| 设计点 | 为什么 |
+|---|---|
+| **必须提权** | 写 `LocalMachine\Root` 与 `HKLM`；不这样做 MSIX 装不上（§4.9） |
+| 未提权时自动 `RunAs` 重启自己 | 用户双击一次即可，参数原样透传 |
+| 日志写 `C:\ProgramData\PaperNotes\install.log` | **提权窗口一关，屏幕输出就没了**，没有日志只能盲猜（见下方 bug） |
+| DLL 用 `PaperNotes.Shell.0.1.0.0.dll` | 进程内扩展文件被锁，同名覆盖必失败（LNK1104）；升级靠换新文件名 |
+| 包内仍叫 `PaperNotes.Shell.dll` | 清单 `Path` 写死，包内不能带版本号 |
+| 安装前清 HKCU 同名注册 | 开发阶段注册在 HKCU，正式装写 HKLM，不清会重复出现两条菜单 |
+| **启动时降权**（`explorer.exe <exe>` 代启） | 提权父子进程会继承管理员权限；一个常驻 GUI + shell 扩展以高权限跑没必要，而且提权进程的 `%LOCALAPPDATA%` 与普通用户不是同一处，先提权跑一次再普通启动会看到**两套便签数据** |
+| 卸载保留便签数据 | 需求明确要求；数据在 `%LOCALAPPDATA%\PaperNotes` |
+| 只删自己装的那张证书 | 按记录的 thumbprint 删，不动别人的根证书 |
+
+**实测踩到并修掉的两个 bug**（都只在提权路径暴露，DryRun 抓不到）：
+
+1. `Find-SdkTool` 用 `$candidates[0]` 取路径。只匹配到一条时 PowerShell 会把字符串当字符数组，
+   返回 `'C'`，于是 `& $makeappx` 报「无法将 C 项识别为 cmdlet」。修法：结果外面套 `@()`。
+2. 安装程序是提权的，直接 `Process.Start` 会让便签程序**继承管理员权限**，
+   结果非管理员连 `Stop-Process` 都杀不掉它，且数据写进了提权用户的位置。修法：用 explorer 代启降权。
+
+**升级注意事项**：本项目现在有**两份 exe**（`C:\Program Files\PaperNotes` 的经典版、
+MSIX 包内的打包版）。两者靠单实例互斥量（`Local\PaperNotes.SingleInstance.v1`）保证只有一个在跑，
+数据目录都收敛到 `%LOCALAPPDATA%\PaperNotes`，不会分叉。
 
 ---
 
@@ -258,6 +301,15 @@ docs/evidence/                截图与日志证据（随仓库版本化）
 ## 6. 常用命令
 
 ```powershell
+# ---- 交付：安装 / 卸载（会弹 UAC）----
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\install.ps1 -Action Install
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\install.ps1 -Action Uninstall
+# 只看计划不改系统
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\install.ps1 -Action Install -DryRun
+# 安装日志（提权窗口关闭后唯一的线索）
+notepad C:\ProgramData\PaperNotes\install.log
+
+# ---- 开发：构建 ----
 # 构建两个项目（会自动先停掉正在运行的 PaperNotes，否则 exe 被占用）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build.ps1 -Action Build
 
@@ -265,12 +317,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build.ps1 -Action Buil
 & "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe" `
   src\App\PaperNotesApp.vcxproj /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
 
+# ---- 开发：菜单注册（免管理员的开发态）----
 # 注册经典 COM 处理器（每用户，无需管理员）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\register-shell-handler.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\register-shell-handler.ps1 -Unregister
 
-# MSIX 松散注册 —— Win11 现代第一层菜单的唯一来源，必须注册
+# MSIX 松散注册（开发态；正式安装请用 install.ps1，它装的是签名包）
 Add-AppxPackage -Register out\package\AppxManifest.xml -ForceApplicationShutdown
+
+# 开机自启（开发态）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\register-autostart.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\register-autostart.ps1 -Unregister
 
 # 不弹菜单就让系统自己构建桌面菜单并列出条目，验证注册是否生效
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\probe-shell-menu.ps1
@@ -346,26 +403,45 @@ Wintrust.dll / WinVerifyTrust
 
 ---
 
-## 8. 本机环境限制（这些「未验证」不是偷懒）
+## 8. 环境限制的真相（2026-10-27 更正，重要）
 
 开发机：Windows 11 Build 26200、单显示器 2560×1600 @150%（dpi=144）、无管理员权限。
 
-应用进程受令牌限制，以下操作 `ERROR_ACCESS_DENIED(5)`：
+**先说结论：早先记录的「应用进程被令牌限制」是*启动上下文*造成的，不是机器限制。**
 
-| 操作 | 结果 | 影响 |
+早期所有验证都是从 agent/受限上下文里拉起 `PaperNotes.exe`，于是出现：
+
+| 操作 | 受限上下文启动 | **用 explorer 正常启动** |
 |---|---|---|
-| 写 `%USERPROFILE%` / `%LOCALAPPDATA%` | 失败 | 存储回退到 exe 目录 |
-| `Shell_NotifyIcon(NIM_ADD)` | 失败 | **托盘图标无法验证**（故做了列表窗口兜底） |
-| 全局钩子收事件 | 静默失败 | 钩子路径无法验证（采样路径已独立验证） |
+| 写 `%LOCALAPPDATA%\PaperNotes` | `ERROR_ACCESS_DENIED(5)` | **成功**（`ok=1 gle=0`） |
+| 写 `%USERPROFILE%\PaperNotesData` | `ERROR_ACCESS_DENIED(5)` | **成功** |
+| `Shell_NotifyIcon(NIM_ADD)` | `ERROR_ACCESS_DENIED(5)` | **成功**（日志 `tray icon added`） |
 
-> **`SetCursorPos` 是间歇性的**：本机多次返回 True 并成功移动光标，
-> 但也会间歇失败（返回 False，`err=203`），此时 computer-use 的输入注入一并被拒
-> （`COMPUTER_USE_INPUT_UNAVAILABLE`）。
-> 这是**会话状态相关的间歇限制**，不是"永久不可用"，也不是实现问题。
-> UI 自动化遇到时等交互桌面恢复再试，别据此判断功能不可行。
+安装程序用 `explorer.exe <exe>` 降权启动后，日志立刻出现：
 
-因此以下结论**必须在正常会话/另一台机器上复验**：托盘图标与菜单、快捷键实际触发、
-用户目录落盘、真正的开机自启。
+```
+writable dir=C:\Users\cx101\AppData\Local\PaperNotes ok=1 gle=0
+tray icon added
+restore: 1 note(s) loaded hidden from C:\Users\cx101\AppData\Local\PaperNotes
+```
+
+**所以**：
+
+1. 存储落在 `<exe目录>\PaperNotesData` **不是设计意图的必然结果**，只是受限启动的副产物；
+   正常启动会落在 `%LOCALAPPDATA%\PaperNotes`（设计意图）。
+2. **托盘图标是好的**，之前"无法验证"是启动方式的问题，不是实现问题。
+   列表窗口兜底仍然保留（Win11 会把托盘图标收进折叠区，仍需要主入口）。
+3. 排查这类问题时，**先怀疑是谁把这个进程拉起来的**，再怀疑代码。
+
+> **仍然成立的限制**：全局低层鼠标钩子在这个会话里收不到真实事件（`hookEvents` 长时间不增），
+> 但采样路径已独立验证可用，且钩子本就是可选的（§4.3）。
+
+> **`SetCursorPos` 是间歇性的**：多次返回 True 并成功移动光标，也会间歇失败
+> （返回 False，`err=203`），此时 computer-use 的输入注入一并被拒
+> （`COMPUTER_USE_INPUT_UNAVAILABLE`）。属于会话状态问题，等交互桌面恢复再试。
+
+**无管理员权限**这一点仍然成立：`LocalMachine\*` 写入、`HKLM` 写入必须靠 UAC 提权，
+所以安装程序按"提权"设计（§4.10）。
 
 另：**无 Windows 10 环境**。**用户已决定不做 Win10 实测**，
 Win10 经典菜单路径按"未验证"处理，不再列入阻塞项。
@@ -375,18 +451,15 @@ Win10 经典菜单路径按"未验证"处理，不再列入阻塞项。
 ## 9. 下一步
 
 1. ~~**开机自启**~~ —— **已完成**，见 §4.8。
-2. **安装程序**：普通安装方式（可接受管理员）。形态取决于 §9-3 选定的分发方式。
-   - 注册 COM 处理器 + CLSID
-   - 配置自启（`tools\register-autostart.ps1` 已可复用）
-   - 卸载时清理菜单集成与启动项，**默认保留便签数据**
-   - 注意：in-process 扩展无法覆盖安装，**DLL 必须用带版本号的文件名**
-3. **决定 MSIX 分发方式（当前最大交付障碍，需要用户拍板）**：
-   三条路的代价见 §4.9 表格。若要面向普通用户分发：
-   - **买 OV/EV 代码签名证书** —— 目标机器零要求，最正规，但花钱且需资质
-   - **自签名 + 安装程序提权写 `LocalMachine\Root`** —— 免费，但每台机器一次 UAC 且装根证书
-   - **放弃现代第一层菜单** —— 违反需求红线，必须先问用户
+2. ~~**安装程序**~~ —— **已完成并端到端验证**，见 §4.10。
+3. ~~**决定 MSIX 分发方式**~~ —— **已决定：自签名 + 提权**（用户拍板），已随安装程序实现并验证。
+   若日后要面向**公开发布**，再评估买 OV/EV 证书替换自签名（安装程序无需改动，
+   只换签名证书；代价对比见 §4.9）。
 4. **UI 打磨**：便签拖动/缩放手感、列表窗口双击行为、删除确认文案。
-5. **阶段 2 验收**：Win11 菜单、连续新建/拖动/边缘/多显示器/不同缩放、
+   另外待用户确认：设置窗口外观（§3 表中标注"界面外观待用户确认"）。
+5. **升级路径实测**：装 → 装新版 → 卸 的完整循环。已知设计要点：
+   DLL 带版本号所以可覆盖安装；卸载保留数据；`Save-State` 记录了证书 thumbprint 与包全名。
+6. **阶段 2 验收**：Win11 菜单、连续新建/拖动/边缘/多显示器/不同缩放、
    自动保存（编辑后关闭、重启、强杀）、启动行为、快捷键冲突、重复启动、安装升级卸载、
    记录「新建到可输入」耗时、空闲内存、异常。（Win10 不做。）
 
@@ -395,6 +468,8 @@ Win10 经典菜单路径按"未验证"处理，不再列入阻塞项。
 - ~~用 `ExplorerCommandHandler` 替代 MSIX~~ —— 实测**不可行**，见 §4.2。
 - ~~Windows 10 实测~~ —— 用户决定不做。
 - ~~开机自启~~ —— 已完成，见 §4.8。
+- ~~MSIX 分发方式~~ —— 已选自签名 + 提权，见 §4.9。
+- ~~安装程序~~ —— 已完成，见 §4.10。
 
 ---
 
@@ -407,23 +482,31 @@ Win10 经典菜单路径按"未验证"处理，不再列入阻塞项。
   先 `Stop-Process DesktopMgr64`，把旧 DLL 重命名，重建后再启动它。
 - **做菜单注册对照实验前，必须先确认 `Get-AppxPackage PaperNotes.Phase0` 状态**：
   MSIX 包会"冒充" shellex 处理器的功劳，导致得出完全相反的结论（本会话真实踩过）。
-- 当前注册状态（每用户，`register-shell-handler.ps1 -Unregister` 可清理）：
+- **当前机器已用 `tools\install.ps1` 正式安装过**，注册状态是**机器级**：
 
   ```
-  HKCU\Software\Classes\CLSID\{3B1A6C2E-6F41-4A1C-9D3A-7E5B2C8F0A12}\InprocServer32
-      = C:\cx_ProjectCode\PaperNotes\out\bin\PaperNotes.Shell.dll   (ThreadingModel=Apartment)
-  HKCU\Software\Classes\DesktopBackground\shellex\ContextMenuHandlers\PaperNotes
-  HKCU\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\PaperNotes
+  HKLM\Software\Classes\CLSID\{3B1A6C2E-6F41-4A1C-9D3A-7E5B2C8F0A12}\InprocServer32
+      = C:\Program Files\PaperNotes\PaperNotes.Shell.0.1.0.0.dll   (ThreadingModel=Apartment)
+  HKLM\Software\Classes\DesktopBackground\shellex\ContextMenuHandlers\PaperNotes
+  HKLM\Software\Classes\Directory\Background\shellex\ContextMenuHandlers\PaperNotes
+  HKLM\Software\Microsoft\Windows\CurrentVersion\Run\PaperNotes = "<install>\PaperNotes.exe" --autostart
+  HKLM\Software\PaperNotes                       (安装状态：InstallDir / ShellDll / CertThumbprint / PackageFullName)
   ```
 
-  另需 MSIX 松散注册包 `PaperNotes.Phase0_0.1.0.0_x64__gzfq254d1nysy`（`Status=Ok`）。
+  MSIX：`PaperNotes.Phase0_0.1.0.0_x64__gzfq254d1nysy`，`SignatureKind=Developer`、`Status=Ok`。
   **这个包是 Win11 现代第一层菜单的唯一来源，删掉菜单项就消失**（已实测）。
+  证书：`CN=PaperNotesDev` 自签名，已导入 `LocalMachine\My` + `Root` + `TrustedPeople`。
+  卸载走 `tools\install.ps1 -Action Uninstall`，它按记录的 thumbprint 只删这一张证书。
+
+- 开发态的每用户注册（HKCU）已被安装程序清理干净。若要回到纯开发态，
+  用 `register-shell-handler.ps1` + `register-autostart.ps1` 重新注册（免管理员）。
 
 - 已弃用但仍保留的脚本（**不要当交付路径**）：
   - `tools\register-shell-verb.ps1`：静态动词，会与处理器重复，仅纯 Win10 兜底时考虑
   - `tools\register-shell-command-handler.ps1`：`ExplorerCommandHandler` 实验工具，
     `-Unregister` 可完全清理。注册后会与处理器重叠，在「显示更多选项」里出现**两条重复项**
 - 实验用注册表备份在 `out\diagnostics\reg-backup-20261027\`（不入库）。
+- `out\signing\` 里有自签名 PFX/cer（**含私钥，切勿入库或外发**）；`out/` 已 gitignore。
 
 ---
 
@@ -438,6 +521,7 @@ Win10 经典菜单路径按"未验证"处理，不再列入阻塞项。
 | `docs/evidence/ech-test-A-msix-removed-desktop-no-item.png` | 移除 MSIX 后桌面现代第一层**无**「新建便签」 |
 | `docs/evidence/ech-test-B-msix-removed-explorer-no-item.png` | 同上，资源管理器文件夹背景 |
 | `docs/evidence/ech-test-C-ech-verb-no-msix-explorer-no-item.png` | 有 ECH 动词、无 MSIX，仍然**无**「新建便签」 |
+| `docs/evidence/installed-desktop-modern-menu.png` | **正式安装后**（签名 MSIX + HKLM 处理器）桌面现代第一层出现「新建便签」 |
 | `docs/phase0-findings.md` | 阶段 0 完整验证记录、DeskGo 逆向证据、§4.5 ECH 否定结论 |
 
 ---
