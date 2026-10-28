@@ -119,15 +119,33 @@ function Install-Files {
   }
 
   New-Item -ItemType Directory -Force $InstallDir | Out-Null
-  try {
-    Copy-Item (Join-Path $bin 'PaperNotes.exe') $InstallDir -Force -ErrorAction Stop
-  } catch {
-    throw "复制 PaperNotes.exe 失败：$($_.Exception.Message)。请先结束 PaperNotes 进程后重试"
+
+  # Copy only what actually differs.  Blindly overwriting the shell DLL fails
+  # whenever Explorer still has it loaded -- even when the new file is byte for
+  # byte the one already there, which is exactly how an install died here after
+  # a rebuild that only touched the exe.
+  function Copy-IfChanged([string]$source, [string]$destination, [string]$label) {
+    if (Test-Path $destination) {
+      $same = (Get-FileHash $source -Algorithm SHA256).Hash -eq
+              (Get-FileHash $destination -Algorithm SHA256).Hash
+      if ($same) {
+        Say "  $label 未变化，跳过"
+        return
+      }
+    }
+    try {
+      Copy-Item $source $destination -Force -ErrorAction Stop
+      Say "  $label"
+    } catch {
+      throw ("复制 $label 失败：$($_.Exception.Message)`n" +
+             "该文件仍被占用。若内容确实变了，请提升 packaging\AppxManifest.xml 的版本号" +
+             "（DLL 文件名带版本号，新版本会写成新文件，不会碰到被加载的旧文件）。")
+    }
   }
+
+  Copy-IfChanged (Join-Path $bin 'PaperNotes.exe') (Join-Path $InstallDir 'PaperNotes.exe') 'PaperNotes.exe'
   # 带版本号，见文件头注释
-  Copy-Item (Join-Path $bin 'PaperNotes.Shell.dll') (Join-Path $InstallDir $dllName) -Force
-  Say "  PaperNotes.exe"
-  Say "  $dllName"
+  Copy-IfChanged (Join-Path $bin 'PaperNotes.Shell.dll') (Join-Path $InstallDir $dllName) $dllName
 
   # Versioned DLL names mean an upgrade leaves the previous file behind.  Drop
   # the superseded copies, but never fail the install over it: Explorer may still
