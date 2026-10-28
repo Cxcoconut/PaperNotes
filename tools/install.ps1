@@ -24,7 +24,9 @@ param(
   # 打包用的暂存目录，装完即删。MSIX 里 DLL 必须叫 PaperNotes.Shell.dll（清单写死）。
   [string]$StagingDir = (Join-Path $env:TEMP 'PaperNotes-Package'),
 
-  [string]$Version = '0.1.0.0',
+  # 空表示从 AppxManifest.xml 读取。默认值与清单分开写会漂移：
+  # 曾经清单升到 0.1.0.1 而这里还停在 0.1.0.0，DLL 文件名和包版本就对不上了。
+  [string]$Version = '',
 
   # 证书口令：仅用于本机 PFX 导出，不外传。生产分发应改用公开 CA 证书。
   [string]$PfxPassword = 'PaperNotesDev',
@@ -43,6 +45,18 @@ $publisher = 'CN=PaperNotesDev'
 $clsidClassic = '{3B1A6C2E-6F41-4A1C-9D3A-7E5B2C8F0A12}'
 $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValue = 'PaperNotes'
+
+# Take the version from the manifest so the DLL file name, the package version
+# and the uninstall state can never disagree.
+if (-not $Version) {
+  $manifestPath = Join-Path $repo 'packaging\AppxManifest.xml'
+  $manifestText = Get-Content $manifestPath -Raw -Encoding UTF8
+  if ($manifestText -match 'Identity[\s\S]*?Version="([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"') {
+    $Version = $Matches[1]
+  } else {
+    throw "无法从 $manifestPath 读取 Identity/Version"
+  }
+}
 $dllName = "PaperNotes.Shell.$Version.dll"
 
 function Say($msg) { Write-Host $msg }
