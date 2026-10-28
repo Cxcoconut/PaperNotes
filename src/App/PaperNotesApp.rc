@@ -1,0 +1,11 @@
+// Resource script for the application.
+//
+// ASCII only on purpose: rc.exe's default codepage is the ANSI one, so non-ASCII
+// text here would need codepage juggling. There is nothing to translate.
+
+#include <windows.h>
+
+// Matches kAppIconId in PaperNotesApp.cpp. The first icon in the resource table
+// is also what the linker stamps onto the exe, so Explorer and the taskbar pick
+// it up without further work.
+101 ICON "app.ico"

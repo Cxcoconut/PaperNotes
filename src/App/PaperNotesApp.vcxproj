@@ -67,6 +67,12 @@
     <ClInclude Include="..\Common\click_state.h" />
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="PaperNotesApp.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="app.ico" />
+  </ItemGroup>
+  <ItemGroup>
     <None Include="app.manifest" />
   </ItemGroup>
 

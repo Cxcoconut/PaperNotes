@@ -58,6 +58,9 @@ constexpr int kMinHeight = 180;
 constexpr int kCascadeStep = 26;
 constexpr int kMaxCascade = 14;
 
+// Must match the ICON id in PaperNotesApp.rc.
+constexpr int kAppIconId = 101;
+
 // ---------------------------------------------------------------- palette
 //
 // Single source of truth for the paper look.  Values come from the "Notes &
@@ -210,6 +213,7 @@ std::wstring LocalAppDataDirectory();
 std::string ToUtf8(const std::wstring& text);
 std::wstring ToWide(const std::string& text);
 void LogLine(const wchar_t* format, ...);
+HICON LoadAppIcon(int width, int height);
 
 int ParseInt(const std::string& text) {
   size_t index = 0;
@@ -1354,6 +1358,12 @@ void RegisterNoteClass() {
   wc.lpfnWndProc = NoteWndProc;
   wc.hInstance = g_instance;
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  // Without this the note falls back to the generic application icon in
+  // Alt+Tab and in the window preview.
+  wc.hIcon = LoadAppIcon(GetSystemMetrics(SM_CXICON),
+                         GetSystemMetrics(SM_CYICON));
+  wc.hIconSm = LoadAppIcon(GetSystemMetrics(SM_CXSMICON),
+                           GetSystemMetrics(SM_CYSMICON));
   wc.lpszClassName = kNoteClass;
   RegisterClassExW(&wc);
   registered = true;
@@ -1534,6 +1544,16 @@ size_t VisibleNoteCount() {
 
 // ----------------------------------------------------------------- tray icon
 
+// Application icon, compiled in from PaperNotesApp.rc.  Loading it at an
+// explicit size matters: the tray asks for SM_CXSMICON (16px at 100%, 24px at
+// 150%), and letting Windows pick a different size makes the glyph look soft.
+HICON LoadAppIcon(int width, int height) {
+  return reinterpret_cast<HICON>(
+      LoadImageW(g_instance, MAKEINTRESOURCEW(kAppIconId), IMAGE_ICON,
+                 width > 0 ? width : 16, height > 0 ? height : 16,
+                 LR_DEFAULTCOLOR));
+}
+
 void AddTrayIcon() {
   if (g_trayAdded) return;
   ZeroMemory(&g_tray, sizeof(g_tray));
@@ -1542,7 +1562,14 @@ void AddTrayIcon() {
   g_tray.uID = kTrayId;
   g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
   g_tray.uCallbackMessage = kMsgTray;
-  g_tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  // Load the application icon at the size the tray actually uses.  It used to be
+  // LoadIconW(nullptr, IDI_APPLICATION), i.e. the generic Windows application
+  // icon, which is why the tray showed a blank look-alike instead of PaperNotes.
+  g_tray.hIcon = LoadAppIcon(GetSystemMetrics(SM_CXSMICON),
+                             GetSystemMetrics(SM_CYSMICON));
+  if (!g_tray.hIcon) {
+    g_tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  }
   wcscpy_s(g_tray.szTip, kAppTitle);
   if (Shell_NotifyIconW(NIM_ADD, &g_tray)) {
     g_trayAdded = true;
@@ -1863,6 +1890,13 @@ constexpr int kSettingsIdCancel = 201;
 HotkeySpec g_specNewNote = {MOD_CONTROL | MOD_ALT, 'N'};
 HotkeySpec g_specList = {MOD_CONTROL | MOD_ALT, 'L'};
 
+// Capture writes the pressed chord straight into the two specs above.  Cancel
+// used to leave those mutations behind, so cancelling a change still altered
+// what ResumeHotkeys registered afterwards.  These hold the values as they were
+// when the dialog opened, and Cancel/Close restores them.
+HotkeySpec g_specNewNoteBackup = {MOD_CONTROL | MOD_ALT, 'N'};
+HotkeySpec g_specListBackup = {MOD_CONTROL | MOD_ALT, 'L'};
+
 HWND g_settings = nullptr;
 HFONT g_settingsFont = nullptr;
 int g_armedSlot = -1;  // 0 = new note, 1 = list, -1 = nothing armed
@@ -2017,6 +2051,40 @@ bool ApplyHotkeys(const HotkeySpec& forNew, const HotkeySpec& forList,
           FormatHotkey(g_specNewNote).c_str(),
           FormatHotkey(g_specList).c_str());
   return true;
+}
+
+// While a hotkey box is armed the user is pressing exactly the chord that is
+// registered system-wide.  RegisterHotKey swallows it and posts WM_HOTKEY, so
+// the action fired instead of the chord being captured -- pressing the current
+// combination created a note and the box never saw the key.  Unregistering for
+// the duration turns the chord back into ordinary keystrokes.
+void SuspendHotkeys() {
+  if (g_hotkeyNewNote) {
+    UnregisterHotKey(g_hidden, kHotkeyNewNote);
+    g_hotkeyNewNote = false;
+  }
+  if (g_hotkeyToggleList) {
+    UnregisterHotKey(g_hidden, kHotkeyToggleList);
+    g_hotkeyToggleList = false;
+  }
+}
+
+// Restores whatever is currently saved.  Deliberately silent: this runs on
+// dialog teardown paths where a message box would be noise, and the saved pair
+// was already validated when it was applied.
+void ResumeHotkeys() {
+  if (!g_hotkeyNewNote && g_specNewNote.virtualKey != 0) {
+    g_hotkeyNewNote =
+        RegisterHotKey(g_hidden, kHotkeyNewNote,
+                       g_specNewNote.modifiers | MOD_NOREPEAT,
+                       g_specNewNote.virtualKey) != FALSE;
+  }
+  if (!g_hotkeyToggleList && g_specList.virtualKey != 0) {
+    g_hotkeyToggleList =
+        RegisterHotKey(g_hidden, kHotkeyToggleList,
+                       g_specList.modifiers | MOD_NOREPEAT,
+                       g_specList.virtualKey) != FALSE;
+  }
 }
 
 void SettingsBoxRects(HWND hwnd, RECT* boxNew, RECT* boxList, RECT* saveRect,
@@ -2202,6 +2270,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
       RECT saveRect = {};
       RECT cancelRect = {};
       SettingsBoxRects(hwnd, &boxNew, &boxList, &saveRect, &cancelRect);
+      const int previousSlot = g_armedSlot;
       if (PtInRect(&boxNew, pt)) {
         g_armedSlot = 0;
       } else if (PtInRect(&boxList, pt)) {
@@ -2209,6 +2278,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
       } else {
         g_armedSlot = -1;
       }
+      // Arming swallows the global hotkeys so the chord can be captured; leaving
+      // a box hands them back.
+      if (g_armedSlot >= 0 && previousSlot < 0) SuspendHotkeys();
+      if (g_armedSlot < 0 && previousSlot >= 0) ResumeHotkeys();
       SetFocus(hwnd);
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
@@ -2233,6 +2306,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
         g_specList = spec;
       }
       g_armedSlot = -1;
+      ResumeHotkeys();
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
@@ -2247,6 +2321,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
         }
         MessageBoxW(hwnd, L"快捷键已更新。", L"纸笺便签",
                     MB_OK | MB_ICONINFORMATION);
+        // Refresh the snapshot so WM_DESTROY does not undo the saved values.
+        g_specNewNoteBackup = g_specNewNote;
+        g_specListBackup = g_specList;
         DestroyWindow(hwnd);
         return 0;
       }
@@ -2267,6 +2344,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wparam,
       }
       g_settings = nullptr;
       g_armedSlot = -1;
+      // Undo any capture the user did not confirm, then hand the hotkeys back.
+      // On the Save path the values were already applied and the backup was
+      // refreshed, so this is a no-op there.
+      g_specNewNote = g_specNewNoteBackup;
+      g_specList = g_specListBackup;
+      ResumeHotkeys();
       return 0;
   }
   return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -2277,6 +2360,9 @@ void ShowHotkeySettings() {
     SetForegroundWindow(g_settings);
     return;
   }
+  // Snapshot what is currently in force so Cancel can undo capture edits.
+  g_specNewNoteBackup = g_specNewNote;
+  g_specListBackup = g_specList;
   static bool registered = false;
   if (!registered) {
     WNDCLASSEXW wc = {};
