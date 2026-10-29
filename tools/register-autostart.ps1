@@ -1,9 +1,15 @@
-param(
-  [string]$ExePath = 'C:\cx_ProjectCode\PaperNotes\out\bin\PaperNotes.exe',
+﻿param(
+  [string]$ExePath,
   [switch]$Unregister
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Default to this clone's build output so the script works from any checkout.
+if (-not $ExePath) {
+  $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+  $ExePath = Join-Path $repo 'out\bin\PaperNotes.exe'
+}
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 # Per-user autostart.

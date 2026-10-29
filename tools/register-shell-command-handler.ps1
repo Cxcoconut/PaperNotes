@@ -1,9 +1,15 @@
-param(
-  [string]$DllPath = 'C:\cx_ProjectCode\PaperNotes\out\bin\PaperNotes.Shell.dll',
+﻿param(
+  [string]$DllPath,
   [switch]$Unregister
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Default to this clone's build output so the script works from any checkout.
+if (-not $DllPath) {
+  $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+  $DllPath = Join-Path $repo 'out\bin\PaperNotes.Shell.dll'
+}
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 # ---------------------------------------------------------------------------

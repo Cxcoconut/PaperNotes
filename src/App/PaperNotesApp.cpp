@@ -560,11 +560,21 @@ void LogLine(const wchar_t* format, ...) {
   OutputDebugStringW(line.c_str());
 
   const std::string utf8 = ToUtf8(line);
-  const std::wstring paths[] = {
-      DataDirectory() + L"\\phase0.log",
-      L"C:\\cx_ProjectCode\\PaperNotes\\out\\diagnostics\\phase0.log",
-  };
+
+  // Two destinations so the log still lands somewhere when the data directory
+  // is not writable (a restricted token, for instance).  Both are derived from
+  // the environment -- no path from the developer's machine is baked in.
+  wchar_t tempPath[MAX_PATH] = {};
+  std::wstring fallback;
+  if (GetTempPathW(MAX_PATH, tempPath) > 0) {
+    fallback = std::wstring(tempPath) + L"PaperNotes";
+    CreateDirectoryW(fallback.c_str(), nullptr);  // already existing is fine
+    fallback += L"\\phase0.log";
+  }
+
+  std::wstring paths[2] = {DataDirectory() + L"\\phase0.log", fallback};
   for (const std::wstring& path : paths) {
+    if (path.empty()) continue;
     HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

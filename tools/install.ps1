@@ -19,7 +19,9 @@ param(
   [ValidateSet('Install', 'Uninstall')]
   [string]$Action = 'Install',
 
-  [string]$InstallDir = (Join-Path $env:ProgramFiles 'PaperNotes'),
+  # 留空表示"询问用户"：安装时在提权窗口里选目录（默认 C:\Program Files\PaperNotes），
+  # 卸载时留空则从 HKLM 状态里读回上次的安装位置。脚本化安装可直接传入固定路径。
+  [string]$InstallDir = '',
 
   # 打包用的暂存目录，装完即删。MSIX 里 DLL 必须叫 PaperNotes.Shell.dll（清单写死）。
   [string]$StagingDir = (Join-Path $env:TEMP 'PaperNotes-Package'),
@@ -75,9 +77,11 @@ function Assert-Admin {
 # 未提权时用 UAC 重新启动自己，参数原样透传。
 function Restart-Elevated {
   $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
-               '-Action', $Action, '-InstallDir', "`"$InstallDir`"",
+               '-Action', $Action,
                '-StagingDir', "`"$StagingDir`"", '-Version', $Version,
                '-PfxPassword', $PfxPassword)
+  # 空目录意味着"让用户选"，透传一个空串会把询问逻辑弄乱，所以干脆不带这个参数。
+  if ($InstallDir) { $argList += @('-InstallDir', "`"$InstallDir`"") }
   if ($SkipAutostart) { $argList += '-SkipAutostart' }
   if ($DryRun) { $argList += '-DryRun' }
   Say "正在请求管理员权限…"
@@ -99,6 +103,97 @@ function Find-SdkTool([string]$name) {
 }
 
 # ---------------------------------------------------------------- 安装
+
+# ------------------------------------------------------- 安装位置选择
+
+# 展开环境变量、去掉引号与尾部分隔符，返回绝对路径。
+# 相对路径直接拒绝：提权窗口的工作目录未必是用户以为的那个。
+function Resolve-InstallDir([string]$path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { throw '安装位置不能为空。' }
+  $expanded = [Environment]::ExpandEnvironmentVariables($path.Trim().Trim('"').Trim("'"))
+  if (-not [System.IO.Path]::IsPathRooted($expanded)) {
+    throw "请填写完整路径（例如 D:\Apps\PaperNotes），不能是相对路径：$expanded"
+  }
+  return [System.IO.Path]::GetFullPath($expanded).TrimEnd('\')
+}
+
+function Assert-InstallDir([string]$path, [switch]$NoCreate) {
+  if ($path -match '^[A-Za-z]:$') { throw "不能直接装到盘符根目录：$path" }
+
+  $windows = $env:SystemRoot
+  if ($path -eq $windows -or
+      $path.StartsWith($windows + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "不能装到 Windows 目录里：$path"
+  }
+
+  if (Test-Path -LiteralPath $path -PathType Leaf) {
+    throw "这个路径是一个文件，不是目录：$path"
+  }
+
+  # 已存在但不像我们的安装目录时停下，别把文件混进用户已有的文件夹。
+  if (Test-Path -LiteralPath $path) {
+    $looksLikeOurs = Test-Path -LiteralPath (Join-Path $path 'PaperNotes.exe')
+    if (-not $looksLikeOurs) {
+      $existing = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue)
+      if ($existing.Count -gt 0) {
+        throw ("该目录已有其他内容，且不是 PaperNotes 的安装目录：$path" +
+               "`n请换一个空目录或新建目录。")
+      }
+    }
+  }
+
+  # DryRun 只打印计划，不该在磁盘上留下任何东西。
+  if ($NoCreate) { return }
+
+  New-Item -ItemType Directory -Force -Path $path | Out-Null
+
+  # 真写一个文件才算数：只读盘、组策略、受控文件夹访问都会在这里暴露。
+  $probe = Join-Path $path '.papernotes-write-test'
+  try {
+    Set-Content -LiteralPath $probe -Value 'ok' -ErrorAction Stop
+    Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
+  } catch {
+    throw "这个目录无法写入：$path`n$($_.Exception.Message)"
+  }
+}
+
+# 系统的文件夹选择框。PowerShell 5.1 控制台默认 STA，可以直接弹；
+# 弹不出来（无桌面会话）就退回手工输入，不让安装卡住。
+function Browse-ForFolder([string]$initial) {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = '选择 PaperNotes 的安装位置'
+    $dialog.ShowNewFolderButton = $true
+    if (Test-Path -LiteralPath $initial) { $dialog.SelectedPath = $initial }
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+      return $dialog.SelectedPath
+    }
+    return $null
+  } catch {
+    Say "  （无法打开文件夹选择框：$($_.Exception.Message)）"
+    return $null
+  }
+}
+
+function Select-InstallDir([string]$default) {
+  Say ''
+  Say '请选择安装位置'
+  Say "  直接回车 = 使用默认：$default"
+  Say '  输入完整路径 = 装到该目录'
+  Say '  输入 b = 打开文件夹选择框'
+  while ($true) {
+    $answer = Read-Host '安装位置'
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $default }
+    if ($answer.Trim() -in @('b', 'B')) {
+      $picked = Browse-ForFolder $default
+      if ($picked) { return $picked }
+      Say '  已取消选择，请重新输入。'
+      continue
+    }
+    return $answer
+  }
+}
 
 function Install-Files {
   Step "安装文件 -> $InstallDir"
@@ -445,7 +540,25 @@ if (-not $DryRun) {
 }
 
 try {
-  if ($Action -eq 'Uninstall') { Uninstall-All; return }
+  if ($Action -eq 'Uninstall') {
+    # 卸载必须作用于真正装好的那个目录，所以优先读回上次写进 HKLM 的位置。
+    if (-not $InstallDir) {
+      $InstallDir = (Get-ItemProperty -Path $stateKey -Name 'InstallDir' -ErrorAction SilentlyContinue).InstallDir
+    }
+    if (-not $InstallDir) { $InstallDir = Join-Path $env:ProgramFiles 'PaperNotes' }
+    $InstallDir = Resolve-InstallDir $InstallDir
+    Say "  卸载目标 $InstallDir"
+    Uninstall-All
+    return
+  }
+
+  # 问用户装哪儿。DryRun 不交互，直接按默认值打印计划。
+  if (-not $InstallDir) {
+    if ($DryRun) { $InstallDir = Join-Path $env:ProgramFiles 'PaperNotes' }
+    else { $InstallDir = Select-InstallDir -default (Join-Path $env:ProgramFiles 'PaperNotes') }
+  }
+  $InstallDir = Resolve-InstallDir $InstallDir
+  Assert-InstallDir $InstallDir -NoCreate:$DryRun
 
   Step "预检"
   if (-not (Test-Path (Join-Path $bin 'PaperNotes.exe'))) { throw "缺少 $bin\PaperNotes.exe，请先 tools\build.ps1 -Action Build" }

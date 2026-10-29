@@ -1,0 +1,12 @@
+# Matches the style the code already uses: two-space indent, 80 columns, braces
+# on the same line. Run `clang-format -i src/App/PaperNotesApp.cpp` if you have
+# clang-format available; the project does not require it to build.
+BasedOnStyle: Google
+IndentWidth: 2
+ContinuationIndentWidth: 4
+ColumnLimit: 80
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never

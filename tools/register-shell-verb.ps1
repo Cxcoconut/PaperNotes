@@ -1,9 +1,15 @@
-param(
-  [string]$Executable = 'C:\cx_ProjectCode\PaperNotes\out\bin\PaperNotes.exe',
+﻿param(
+  [string]$Executable,
   [switch]$Unregister
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Default to this clone's build output so the script works from any checkout.
+if (-not $Executable) {
+  $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+  $Executable = Join-Path $repo 'out\bin\PaperNotes.exe'
+}
 
 # Per-user shell verbs.  They appear in the classic desktop context menu
 # ("Show more options") and in third-party desktop replacements that enumerate

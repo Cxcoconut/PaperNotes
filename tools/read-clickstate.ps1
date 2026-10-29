@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$MappingName = 'Local\PaperNotes.ClickState.v1'
 )
 

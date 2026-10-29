@@ -1,0 +1,91 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate MSBuild
+        id: msbuild
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe not found on the runner' }
+          $root = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $root) { throw 'Visual C++ build tools not found' }
+          $msbuild = Join-Path $root 'MSBuild\Current\Bin\MSBuild.exe'
+          "path=$msbuild" >> $env:GITHUB_OUTPUT
+
+      - name: Build application and shell extension
+        shell: pwsh
+        run: |
+          & '${{ steps.msbuild.outputs.path }}' src\App\PaperNotesApp.vcxproj `
+            /nologo /m /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "app build failed ($LASTEXITCODE)" }
+          & '${{ steps.msbuild.outputs.path }}' src\Shell\PaperNotesShell.vcxproj `
+            /nologo /m /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "shell build failed ($LASTEXITCODE)" }
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          foreach ($file in 'PaperNotes.exe', 'PaperNotes.Shell.dll') {
+            $path = Join-Path 'out\bin' $file
+            if (-not (Test-Path $path)) { throw "missing build output: $path" }
+            $size = (Get-Item $path).Length
+            if ($size -lt 10000) { throw "$path looks empty ($size bytes)" }
+            "{0,-24} {1,8:N0} bytes" -f $file, $size
+          }
+
+      - name: Check PowerShell scripts parse
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem tools\*.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              Write-Host "::error file=$($_.FullName)::$($errors[0].Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { throw 'one or more scripts failed to parse' }
+          'all scripts parse'
+
+      - name: Verify PowerShell scripts are UTF-8 with BOM
+        shell: pwsh
+        run: |
+          # Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI. Chinese literals
+          # then turn to mojibake and the script stops parsing, which has broken
+          # this repo more than once.
+          $failed = $false
+          Get-ChildItem tools\*.ps1 | ForEach-Object {
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            $hasBom = $bytes.Length -ge 3 -and
+                      $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+            if (-not $hasBom) {
+              Write-Host "::error file=$($_.FullName)::missing UTF-8 BOM"
+              $failed = $true
+            }
+          }
+          if ($failed) { throw 'one or more scripts are missing the UTF-8 BOM' }
+          'all scripts carry the BOM'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PaperNotes-x64
+          path: |
+            out/bin/PaperNotes.exe
+            out/bin/PaperNotes.Shell.dll
+          if-no-files-found: error

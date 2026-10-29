@@ -1,11 +1,13 @@
-# UI verification helper for the desktop context menu.
+﻿# UI verification helper for the desktop context menu.
 #
 # Minimizes every normal window so the desktop is exposed, then a human/agent
 # right-clicks the background and screenshots the menu.  It deliberately does
 # NOT click anything in the menu: this script only prepares the desktop.
 #
 # Used on 2026-10-27 to prove that ExplorerCommandHandler cannot replace the
-# MSIX package (see docs/phase0-findings.md 4.5).
+# MSIX package: with the package removed, the first-level menu entry disappeared
+# in every variant (registry verb, COM handler, direct COM activation) while the
+# classic menu still worked.  See the "工作原理" section of README.md.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui-verify-menu.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui-verify-menu.ps1 -Restore

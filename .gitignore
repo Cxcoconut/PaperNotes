@@ -1,4 +1,26 @@
+# Build output
 out/
+
+# Visual Studio
 .vs/
 *.user
 *.suo
+*.VC.db
+*.VC.opendb
+
+# Signing material. NEVER commit: the PFX holds the private key that signs the
+# MSIX package.
+*.pfx
+*.cer
+
+# Logs and diagnostics
+*.log
+
+# Python bytecode (tools/make-icon.py)
+__pycache__/
+*.pyc
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store

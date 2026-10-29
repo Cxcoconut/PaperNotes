@@ -1,4 +1,4 @@
-# Enumerate the REAL shell context menu for the desktop background by asking
+﻿# Enumerate the REAL shell context menu for the desktop background by asking
 # the shell to build it, without showing any UI.  This tells us whether the
 # registry verb is visible to Explorer, independent of any third-party desktop
 # replacement that may be drawing its own menu.

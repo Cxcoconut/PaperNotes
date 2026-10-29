@@ -1,4 +1,4 @@
-param(
+﻿param(
   [ValidateSet('Build', 'Install', 'Uninstall', 'Clean')]
   [string]$Action = 'Build'
 )

@@ -17,8 +17,9 @@ public static class PN {
 }
 '@
 
-$exe = 'C:\cx_ProjectCode\PaperNotes\out\bin\PaperNotes.exe'
-$log = 'C:\cx_ProjectCode\PaperNotes\out\diagnostics\phase0.log'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$exe = Join-Path $repo 'out\bin\PaperNotes.exe'
+$log = Join-Path $repo 'out\diagnostics\phase0.log'
 
 function Start-App {
   $sh = New-Object -ComObject Shell.Application
@@ -55,7 +56,7 @@ $text = $line1 + "`r`n" + $line2
 Start-Sleep -Seconds 2
 
 '==== 4. disk check ===='
-$storeRoots = @("$env:LOCALAPPDATA\PaperNotes", "$env:USERPROFILE\PaperNotesData", "$env:TEMP\PaperNotes", 'C:\cx_ProjectCode\PaperNotes\out\bin\PaperNotesData')
+$storeRoots = @("$env:LOCALAPPDATA\PaperNotes", "$env:USERPROFILE\PaperNotesData", "$env:TEMP\PaperNotes", (Join-Path $repo 'out\bin\PaperNotesData'))
 $foundStore = $null
 foreach ($root in $storeRoots) {
   $notesDir = Join-Path $root 'notes'

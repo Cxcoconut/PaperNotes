@@ -8,6 +8,7 @@ The .ico is assembled by hand because PIL can only resize a single image into
 every slot; PNG-compressed entries let each size keep its own drawing.
 """
 
+import os
 import struct
 
 from PIL import Image, ImageDraw
@@ -115,8 +116,23 @@ def main():
     write_ico("src/App/app.ico", entries)
     print("wrote src/App/app.ico with sizes:", [s for s, _ in entries])
 
-    big.resize((256, 256), Image.LANCZOS).save("docs/evidence/app-icon-256.png")
-    print("wrote docs/evidence/app-icon-256.png")
+    # MSIX tile assets referenced by AppxManifest.xml. Drawn from the same master
+    # so the package tile and the exe icon cannot drift apart.
+    assets = {
+        "StoreLogo.png": 50,
+        "Square44x44Logo.png": 44,
+        "Square150x150Logo.png": 150,
+        "Square310x310Logo.png": 310,
+    }
+    for name, size in assets.items():
+        path = "packaging/Assets/" + name
+        big.resize((size, size), Image.LANCZOS).save(path)
+        print("wrote {} {}x{}".format(path, size, size))
+
+    # Preview only; out/ is not part of the repository.
+    os.makedirs("out/diagnostics", exist_ok=True)
+    big.resize((256, 256), Image.LANCZOS).save("out/diagnostics/app-icon-256.png")
+    print("wrote out/diagnostics/app-icon-256.png")
 
 
 if __name__ == "__main__":
