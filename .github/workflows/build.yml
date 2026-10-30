@@ -82,7 +82,7 @@ jobs:
           if ($failed) { throw 'one or more scripts are missing the UTF-8 BOM' }
           'all scripts carry the BOM'
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: PaperNotes-x64
           path: |
