@@ -198,6 +198,10 @@ powershell -ExecutionPolicy Bypass -File tools\verify-persistence.ps1
 
 > 改 `tools\*.ps1` 时**必须存为 UTF-8 with BOM**。Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，中文字面量会变成乱码并导致语法错误。CI 会检查这一条。
 
+> **改了 shell 扩展就必须升 `packaging\AppxManifest.xml` 的版本号。** `PaperNotes.Shell.dll` 是被 Explorer 进程内加载的，文件一直被锁着；即使源码没变，重新构建出的字节也不同（PE 时间戳与调试信息路径），安装程序无法覆盖。版本号决定 DLL 的文件名（`PaperNotes.Shell.<版本>.dll`），升版本号就等于换一个新文件名，天然绕开被加载的旧文件。
+
+> 装完后 `C:\Program Files\PaperNotes\PaperNotes.exe` 与 MSIX 包内那份（`C:\Program Files\WindowsApps\...`）应当**逐字节相同**。桌面第一层菜单启动的是包内那份，自启启动的是 Program Files 那份；两者不同步时会出现「菜单里是旧版本」的怪现象，安装程序会校验并拒绝这种结果。
+
 ## 贡献
 
 Issue 和 PR 都欢迎。提 PR 前请确认：
