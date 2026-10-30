@@ -26,7 +26,14 @@ function Invoke-MSBuild {
 }
 
 function Stop-PaperNotesProcesses {
-  Get-Process -Name PaperNotes -ErrorAction SilentlyContinue | Stop-Process -Force
+  $running = Get-Process -Name PaperNotes -ErrorAction SilentlyContinue
+  if ($running) {
+    # Say it out loud: the exe cannot be replaced while it runs, so a rebuild
+    # stops the app -- including the copy started at logon by autostart.  Silence
+    # here looks like "autostart stopped working" on the next glance at the tray.
+    Write-Host "停止运行中的 PaperNotes (pid=$($running.Id -join ','))；下次登录或手动启动会恢复"
+    $running | Stop-Process -Force
+  }
 }
 
 function Remove-ExistingPackage {

@@ -2607,6 +2607,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   LogLine(L"desktop station=%s desktop=%s",
           UserObjectName(GetProcessWindowStation()).c_str(),
           UserObjectName(GetThreadDesktop(GetCurrentThreadId())).c_str());
+  // Record which copy of the binary is running.  The MSIX package installs its
+  // own copy under WindowsApps and the installer also writes one to Program
+  // Files, so a stale package can run next to a fresh install; without the path
+  // in the log that mismatch is invisible.
+  {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, _countof(exePath));
+    LogLine(L"exe=%s", exePath);
+  }
   LogLine(L"phase0 app started; pid=%lu wantsNewNote=%d autostart=%d mapping=%d",
           GetCurrentProcessId(), wantsNewNote ? 1 : 0, isAutostart ? 1 : 0,
           g_click ? 1 : 0);

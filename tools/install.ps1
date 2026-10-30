@@ -328,9 +328,35 @@ function Build-And-SignPackage() {
   return $msix
 }
 
+# The package carries its own copy of the exe under WindowsApps, and that is what
+# the Win11 first-level menu launches -- not the file in $InstallDir.  If the
+# package ends up holding an older exe than the one just built, the menu starts a
+# stale build while everything else looks installed.  Compare the two so that
+# mismatch fails here instead of showing up later as "the icon reverted".
+function Assert-PackageParity {
+  if ($DryRun) { Say "  [dry] 校验包内 exe 与构建产物一致"; return }
+
+  $pkg = Get-AppxPackage -Name 'PaperNotes.Phase0' -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $pkg) { throw '安装后找不到 PaperNotes.Phase0 包' }
+
+  $packaged = Join-Path $pkg.InstallLocation 'PaperNotes.exe'
+  if (-not (Test-Path $packaged)) { throw "包内缺少 PaperNotes.exe：$packaged" }
+
+  $built = (Get-FileHash (Join-Path $bin 'PaperNotes.exe') -Algorithm SHA256).Hash
+  $inPackage = (Get-FileHash $packaged -Algorithm SHA256).Hash
+  if ($built -ne $inPackage) {
+    Say "  !! 包内 exe 与刚构建的不一致"
+    Say "     构建: $built"
+    Say "     包内: $inPackage"
+    throw ("MSIX 包里的 exe 不是这次构建的产物，安装结果不可信。" +
+           "请先删除 $StagingDir 与 out\\PaperNotes.signed.msix 后重试。")
+  }
+  Say '  包内 exe 与构建产物一致'
+}
+
 function Install-Package {
   param([string]$MsixPath)
-
   Step "安装 MSIX（现代第一层菜单）"
   if ($DryRun) { Say "  [dry] Add-AppxPackage"; return $null }
 
@@ -570,6 +596,7 @@ try {
   $cert = Ensure-SigningCert
   $msix = Build-And-SignPackage -Cert $cert
   $pkg = Install-Package -MsixPath $msix
+  Assert-PackageParity
   Clear-UserLeftovers
   Register-ClassicHandler
   Register-Autostart
