@@ -65,6 +65,17 @@ switch ($Action) {
     if (-not (Test-Path (Join-Path $package 'PaperNotes.exe'))) { throw 'Packaged executable missing.' }
     if (-not (Test-Path (Join-Path $package 'PaperNotes.Shell.dll'))) { throw 'Packaged shell DLL missing.' }
 
+    # The staged copy is what the dev "loose register" path installs, so a stale
+    # copy would register an older version than the source tree says. Compare the
+    # two instead of assuming the copy above did what it looks like it does.
+    $stagedManifest = Join-Path $package 'AppxManifest.xml'
+    [xml]$stagedXml = Get-Content -Raw -Encoding UTF8 $stagedManifest
+    $sourceVersion = $xml.Package.Identity.Version
+    $stagedVersion = $stagedXml.Package.Identity.Version
+    if ($sourceVersion -ne $stagedVersion) {
+      throw "暂存清单版本 $stagedVersion 与源清单 $sourceVersion 不一致（$stagedManifest 是旧的）"
+    }
+
     Get-Item (Join-Path $package 'PaperNotes.exe'), (Join-Path $package 'PaperNotes.Shell.dll') |
       Select-Object Name, Length, LastWriteTime
     break
