@@ -12,7 +12,10 @@
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{7D1A52B9-6A0D-4F5C-9A53-6D8A2E7C4B01}</ProjectGuid>
     <RootNamespace>PaperNotes</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <!-- 10.0 means "the newest installed 10.x SDK". Pinning an exact SDK build
+         (10.0.26100.0) made the project unbuildable on any machine or CI image
+         that shipped a different one. -->
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
