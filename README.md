@@ -1,5 +1,9 @@
 # 纸笺便签 · PaperNotes
 
+[![build](https://github.com/Cxcoconut/PaperNotes/actions/workflows/build.yml/badge.svg)](https://github.com/Cxcoconut/PaperNotes/actions/workflows/build.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![platform: Windows 11 x64](https://img.shields.io/badge/platform-Windows%2011%20x64-0078D4)
+
 在 Windows 11 桌面空白处右键即可新建的便签。便签直接出现在你点右键的地方，是一张张小巧的纸质窗口，关掉不丢、重启还在。
 
 原生 Win32 C++ 写成，单个可执行文件约 250 KB，无 Electron、无 .NET、无安装器框架依赖。
