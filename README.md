@@ -196,7 +196,17 @@ powershell -ExecutionPolicy Bypass -File tools\verify-persistence.ps1
 
 日志：`%LOCALAPPDATA%\PaperNotes\phase0.log`（不可写时退回 `%TEMP%\PaperNotes\phase0.log`）。
 
-> 改 `tools\*.ps1` 时**必须存为 UTF-8 with BOM**。Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，中文字面量会变成乱码并导致语法错误。
+> 改 `tools\*.ps1` 时**必须存为 UTF-8 with BOM**。Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，中文字面量会变成乱码并导致语法错误。CI 会检查这一条。
+
+## 贡献
+
+Issue 和 PR 都欢迎。提 PR 前请确认：
+
+- `tools\build.ps1 -Action Build` 能通过（CI 跑的是同一套构建）
+- `tools\*.ps1` 保持 **UTF-8 with BOM**，否则 CI 会直接拦下
+- 提交里不要出现 `out\`、证书或私钥（`.gitignore` 已覆盖，别强行 `-f` 加进来）
+
+改动涉及菜单注册、安装程序或存储格式时，请在 PR 描述里写清**验证方式**：做了什么操作、看到什么结果。这个项目踩过几次「看起来通过其实没验证」的坑，所以更看重可复现的验证而不是结论本身。
 
 ## 许可证
 
