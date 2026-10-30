@@ -53,6 +53,8 @@ powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Action Build
 
 ### 2. 安装
 
+**双击仓库根目录的 `install.cmd`**，或：
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Action Install
 ```
@@ -88,6 +90,8 @@ powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Action Install -DryR
 ```
 
 ### 3. 卸载
+
+**双击 `uninstall.cmd`**，或：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Action Uninstall
