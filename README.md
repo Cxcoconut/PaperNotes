@@ -21,8 +21,9 @@
 - **多张并存**：可拖动、可缩放，自动错位避免完全重叠
 - **自动保存**：内容与窗口位置、尺寸都会保存，重启后恢复但**保持隐藏**，不打扰
 - **两种关闭语义**：标题栏 `−` 隐藏、`×` 删除（删除需二次确认）
+- **删除可回退**：删除只是移到历史，历史里再删才是真删；空便签直接销毁不进历史
 - **全局快捷键**：默认 `Ctrl+Alt+N` 新建、`Ctrl+Alt+L` 显示/隐藏列表，可在设置里改，冲突有提示
-- **便签列表**：托盘图标不可用时的可靠入口，可打开、删除、进设置
+- **便签列表**：托盘图标不可用时的可靠入口，可打开、删除、进历史、进设置
 - **纸质界面**：暖墨配色，标题栏按钮用线条绘制，滚动条按需出现
 - **DPI 感知**：PerMonitorV2，150% 缩放下布局不塌
 
@@ -110,8 +111,24 @@ powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Action Uninstall
 | 新建便签 | 桌面右键「新建便签」，或 `Ctrl+Alt+N` |
 | 打开便签列表 | `Ctrl+Alt+L`，或托盘图标菜单 |
 | 隐藏便签 | 标题栏 `−` |
-| 删除便签 | 标题栏 `×`，二次确认 |
+| 删除便签 | 标题栏 `×`，二次确认 → 移入历史 |
+| 查看/恢复历史 | 列表窗口 →「历史」 |
+| 永久删除 | 历史窗口 →「永久删除」或「清空历史」，二次确认 |
 | 改快捷键 | 列表窗口 →「设置」 |
+
+### 历史
+
+删除不是终点：`×` 与列表里的「删除」都只是把便签**移到历史**，只有历史窗口里的删除才真的销毁文件。
+
+<img src="docs/evidence/history-window.png" width="420" alt="历史便签窗口">
+
+- 历史按删除时间**倒序**排列，条目显示为 `[月-日 时:分] 正文首行`
+- 「恢复」把文件移回便签目录并重新打开窗口，几何位置与正文原样保留
+- 「永久删除」「清空历史」都需二次确认，文案写明无法恢复
+- **空便签直接销毁**，不进历史——否则历史会被空壳塞满
+- 历史**默认不自动清理**，会一直累积；界面不显示条数上限，因为确实没有上限
+
+> 历史是**明文**保存已删内容的。想让某段内容彻底消失，必须到历史里再删一次。
 
 ## 工作原理
 
@@ -145,11 +162,26 @@ h=405
 便签正文，UTF-8，可含换行
 ```
 
-目录按可写性依次回退：`%LOCALAPPDATA%\PaperNotes` → `%USERPROFILE%\PaperNotesData` → `%TEMP%\PaperNotes`。同一时刻只允许一个实例（互斥量 `Local\PaperNotes.SingleInstance.v1`）。
+历史条目是同样的格式，只在头部多两行，所以出问题时仍可用记事本打开抢救：
+
+```
+x=870
+y=481
+w=510
+h=405
+deleted=1793691919
+deletedfrom=window
+
+便签正文
+```
+
+`deleted` 是 UTC 秒；`deletedfrom` 记录删除入口（`window` / `list`），便于排查。
+
+目录按可写性依次回退：`%LOCALAPPDATA%\PaperNotes` → `%USERPROFILE%\PaperNotesData` → `%TEMP%\PaperNotes`。便签在 `notes\`，历史在 `history\`。同一时刻只允许一个实例（互斥量 `Local\PaperNotes.SingleInstance.v1`）。
 
 ### 界面与尺寸
 
-所有布局常量都是设备无关像素（DIP），统一经 `ScaleFor(dpi, value)` 缩放。便签默认 310×245 DIP，列表 470×400 DIP。
+所有布局常量都是设备无关像素（DIP），统一经 `ScaleFor(dpi, value)` 缩放。便签默认 310×245 DIP，列表 560×400 DIP（六个按钮），历史窗口 470×430 DIP。
 
 配色只有一处定义，便签、列表、设置三个窗口共用。托盘图标由 `tools/make-icon.py` 生成多尺寸 ICO，其中 16/20px 使用单独的简化画法——把高分辨率细节直接缩到 16px 会糊。
 
@@ -166,6 +198,7 @@ MSIX 的安装由 AppX 部署服务校验，它只信任**机器级**证书存�
 - **需要管理员安装**（自签名证书 + `Program Files`）。
 - **验收未完成**：多显示器、不同缩放组合、连续新建压力、空闲内存与延迟指标都还没有系统测过。
 - 数据是本地明文，没有加密与同步。
+- **历史没有容量上限**，也不自动清理；删得多就会一直占用磁盘，需要手动「清空历史」。
 - 便签标题固定为「便签」，不能重命名。
 
 ## 项目结构
@@ -192,6 +225,9 @@ powershell -ExecutionPolicy Bypass -File tools\probe-shell-menu.ps1
 
 # 端到端验证持久化：新建 → 写文本 → 落盘 → 杀进程 → 重启 → 确认恢复
 powershell -ExecutionPolicy Bypass -File tools\verify-persistence.ps1
+
+# 端到端验证历史：删除 → 进历史 → 重启仍在 → 恢复 → 空便签销毁 → 清空
+powershell -ExecutionPolicy Bypass -File tools\verify-history.ps1
 ```
 
 日志：`%LOCALAPPDATA%\PaperNotes\phase0.log`（不可写时退回 `%TEMP%\PaperNotes\phase0.log`）。

@@ -30,6 +30,7 @@ using papernotes::kClickStateMappingName;
 constexpr wchar_t kHiddenClass[] = L"PaperNotes.HiddenWindow.v1";
 constexpr wchar_t kNoteClass[] = L"PaperNotes.NoteWindow.v1";
 constexpr wchar_t kListClass[] = L"PaperNotes.ListWindow.v1";
+constexpr wchar_t kHistoryClass[] = L"PaperNotes.HistoryWindow.v1";
 constexpr wchar_t kAppTitle[] = L"纸笺便签";
 
 constexpr UINT kMsgTray = WM_APP + 1;
@@ -98,7 +99,9 @@ constexpr int kHotkeyNewNote = 1;
 constexpr int kHotkeyToggleList = 2;
 bool g_hotkeyNewNote = false;
 bool g_hotkeyToggleList = false;
-void ShowHotkeySettings();// If the hook point and the menu-build point agree this closely, they describe
+void ShowHotkeySettings();
+void ShowHistoryWindow();
+void RefreshHistoryList();// If the hook point and the menu-build point agree this closely, they describe
 // the same physical click and the hook (the true right-button-down) wins.
 constexpr LONG kAgreementTolerancePx = 64;
 
@@ -144,6 +147,9 @@ NoteLayout LayoutFor(UINT dpi) {
 
 HINSTANCE g_instance = nullptr;
 HWND g_hidden = nullptr;
+// Declared up here because the note window's delete handler refreshes the
+// history list, and that window is defined before the history section.
+HWND g_history = nullptr;
 HHOOK g_mouseHook = nullptr;
 volatile LONG64 g_hookEventCount = 0;
 volatile LONG64 g_hookRightDownCount = 0;
@@ -329,12 +335,18 @@ bool ReadAllBytes(const std::wstring& path, std::string* bytes) {
   return ok != FALSE;
 }
 
-void EnsureNoteId(NoteState* note) {
-  if (!note || !note->id.empty()) return;
+// Identity for a note that has never been written to disk. Restoring from
+// history needs the same generator when the original id is already taken.
+std::wstring MakeNoteId() {
   wchar_t buffer[64] = {};
   _snwprintf_s(buffer, _countof(buffer), _TRUNCATE, L"%llu-%lu",
                GetTickCount64(), GetCurrentProcessId());
-  note->id = buffer;
+  return buffer;
+}
+
+void EnsureNoteId(NoteState* note) {
+  if (!note || !note->id.empty()) return;
+  note->id = MakeNoteId();
 }
 
 std::wstring NoteFilePath(const NoteState* note) {
@@ -384,6 +396,181 @@ void SaveNote(NoteState* note, bool force) {
 void DeleteNoteFile(const NoteState* note) {
   if (!note || note->id.empty()) return;
   DeleteFileW(NoteFilePath(note).c_str());
+}
+
+// ------------------------------------------------------------------- history
+//
+// Deleting a note moves it here instead of destroying it; only a delete inside
+// the history window removes the bytes.  The file keeps the note format plus two
+// header keys, so an entry stays a readable text file that can be rescued by
+// hand if the UI ever misbehaves.
+
+std::wstring HistoryDirectory() {
+  std::wstring directory = StoreDirectory() + L"\\history";
+  CreateDirectoryW(directory.c_str(), nullptr);
+  return directory;
+}
+
+std::wstring HistoryFilePath(const std::wstring& id) {
+  if (id.empty()) return {};
+  return HistoryDirectory() + L"\\" + id + L".note";
+}
+
+unsigned long long NowUnixSeconds() {
+  FILETIME utc = {};
+  GetSystemTimeAsFileTime(&utc);
+  ULARGE_INTEGER value = {};
+  value.LowPart = utc.dwLowDateTime;
+  value.HighPart = utc.dwHighDateTime;
+  // 100 ns ticks since 1601 -> whole seconds since 1970
+  return value.QuadPart / 10000000ULL - 11644473600ULL;
+}
+
+SYSTEMTIME LocalTimeFromUnix(unsigned long long seconds) {
+  ULARGE_INTEGER value = {};
+  value.QuadPart = (seconds + 11644473600ULL) * 10000000ULL;
+  FILETIME utc = {value.LowPart, value.HighPart};
+  FILETIME local = {};
+  FileTimeToLocalFileTime(&utc, &local);
+  SYSTEMTIME result = {};
+  FileTimeToSystemTime(&local, &result);
+  return result;
+}
+
+// Epoch values do not fit the int that ParseInt returns, and pulling in the CRT
+// strtoull for one field is not worth it.
+unsigned long long ParseUnsigned(const std::string& text) {
+  unsigned long long value = 0;
+  for (const char c : text) {
+    if (c < '0' || c > '9') break;
+    value = value * 10ULL + static_cast<unsigned long long>(c - '0');
+  }
+  return value;
+}
+
+struct HistoryEntry {
+  std::wstring id;
+  std::wstring text;
+  RECT geometry = {0, 0, kInitialWidth, kInitialHeight};
+  unsigned long long deletedAt = 0;  // UTC seconds, 0 when the file lacks it
+  std::wstring source;               // "window" or "list"
+};
+
+void ParseHistoryFile(const std::wstring& id, const std::string& bytes,
+                      HistoryEntry* out) {
+  out->id = id;
+  const size_t split = bytes.find("\n\n");
+  if (split == std::string::npos) {
+    out->text = ToWide(bytes);
+    return;
+  }
+  out->text = ToWide(bytes.substr(split + 2));
+
+  int x = 0, y = 0, w = kInitialWidth, h = kInitialHeight;
+  const std::string header = bytes.substr(0, split);
+  size_t start = 0;
+  while (start < header.size()) {
+    const size_t end = header.find('\n', start);
+    const std::string line =
+        header.substr(start, end == std::string::npos ? std::string::npos
+                                                      : end - start);
+    const size_t equals = line.find('=');
+    if (equals != std::string::npos && equals > 0) {
+      const std::string value = line.substr(equals + 1);
+      if (line.compare(0, 8, "deleted=") == 0) {
+        out->deletedAt = ParseUnsigned(value);
+      } else if (line.compare(0, 12, "deletedfrom=") == 0) {
+        out->source = ToWide(value);
+      } else {
+        const int number = ParseInt(value);
+        switch (line[0]) {
+          case 'x': x = number; break;
+          case 'y': y = number; break;
+          case 'w':
+            if (number >= kMinWidth) w = number;
+            break;
+          case 'h':
+            if (number >= kMinHeight) h = number;
+            break;
+          default: break;
+        }
+      }
+    }
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  out->geometry.left = x;
+  out->geometry.top = y;
+  out->geometry.right = x + w;
+  out->geometry.bottom = y + h;
+}
+
+std::vector<HistoryEntry> LoadHistory() {
+  std::vector<HistoryEntry> entries;
+  const std::wstring directory = HistoryDirectory();
+  WIN32_FIND_DATAW data = {};
+  HANDLE find = FindFirstFileW((directory + L"\\*.note").c_str(), &data);
+  if (find == INVALID_HANDLE_VALUE) return entries;
+  do {
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    const std::wstring name = data.cFileName;
+    const size_t dot = name.rfind(L'.');
+    if (dot == std::wstring::npos) continue;
+    std::string bytes;
+    if (!ReadAllBytes(directory + L"\\" + name, &bytes)) continue;
+    HistoryEntry entry;
+    ParseHistoryFile(name.substr(0, dot), bytes, &entry);
+    entries.push_back(std::move(entry));
+  } while (FindNextFileW(find, &data));
+  FindClose(find);
+
+  // Newest first: that is the order people look for "the one I just deleted".
+  std::sort(entries.begin(), entries.end(),
+            [](const HistoryEntry& left, const HistoryEntry& right) {
+              return left.deletedAt > right.deletedAt;
+            });
+  return entries;
+}
+
+// Returns false only when the note could not be preserved, so the caller can
+// keep the window instead of pretending the delete went through.
+bool MoveNoteToHistory(NoteState* note, const wchar_t* source) {
+  if (!note) return true;
+  EnsureNoteId(note);
+
+  const std::wstring text = EditText(note->edit);
+  // An empty note carries nothing worth keeping: destroy it outright so the
+  // history does not fill up with shells.
+  if (text.empty()) {
+    DeleteFileW(NoteFilePath(note).c_str());
+    LogLine(L"history: empty note %s deleted outright", note->id.c_str());
+    return true;
+  }
+
+  // Flush first: the debounce timer may still owe the last keystrokes.
+  SaveNote(note, true);
+
+  RECT rect = {};
+  if (note->hwnd) GetWindowRect(note->hwnd, &rect);
+  wchar_t header[256] = {};
+  _snwprintf_s(header, _countof(header), _TRUNCATE,
+               L"x=%ld\ny=%ld\nw=%ld\nh=%ld\ndeleted=%llu\ndeletedfrom=%s\n\n",
+               rect.left, rect.top, rect.right - rect.left,
+               rect.bottom - rect.top, NowUnixSeconds(),
+               source ? source : L"unknown");
+
+  std::string bytes = ToUtf8(header);
+  bytes += ToUtf8(text);
+  const std::wstring target = HistoryFilePath(note->id);
+  if (!WriteAllBytes(target, bytes)) {
+    LogLine(L"history: write failed id=%s path=%s", note->id.c_str(),
+            target.c_str());
+    return false;
+  }
+  DeleteFileW(NoteFilePath(note).c_str());
+  LogLine(L"history: kept id=%s chars=%zu source=%s", note->id.c_str(),
+          text.size(), source ? source : L"unknown");
+  return true;
 }
 
 struct LoadedNote {
@@ -1273,13 +1460,19 @@ LRESULT CALLBACK NoteWndProc(HWND hwnd, UINT message, WPARAM wparam,
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       if (which == 1) {
-        // Delete, with confirmation: it is the only destructive action.
+        // Delete now means "move to history". The only action that destroys note
+        // text lives in the history window, so the wording has to match that.
         if (MessageBoxW(hwnd,
-                        L"\u5220\u9664\u8FD9\u5F20\u4FBF\u7B7E\uFF1F\n\n"
-                        L"\u5220\u9664\u540E\u65E0\u6CD5\u6062\u590D\u3002",
-                        L"\u5220\u9664\u4FBF\u7B7E",
+                        L"删除这张便签？\n\n它会移到历史里，可以从历史恢复。",
+                        L"删除便签",
                         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
-          if (state) DeleteNoteFile(state);
+          if (state && !MoveNoteToHistory(state, L"window")) {
+            MessageBoxW(hwnd,
+                        L"无法移到历史（便签文件写入失败），便签已保留。",
+                        L"删除失败", MB_OK | MB_ICONWARNING);
+            return 0;
+          }
+          if (g_history) RefreshHistoryList();
           // WM_DESTROY unlinks the state from g_notes; do not do it here too.
           DestroyWindow(hwnd);
         }
@@ -1513,6 +1706,69 @@ void SaveAllNotes() {
   for (NoteState* note : g_notes) SaveNote(note, true);
 }
 
+// Brings a history entry back to life: the file returns to the notes directory
+// and a window is created for it, so afterwards it behaves like any other note.
+bool RestoreHistoryEntry(const HistoryEntry& entry) {
+  RECT rect = entry.geometry;
+  std::wstring id = entry.id.empty() ? MakeNoteId() : entry.id;
+  std::wstring target = NoteFilesDirectory() + L"\\" + id + L".note";
+  // A live note already owning this id would be overwritten; give the restored
+  // copy a fresh identity instead.
+  if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    id = MakeNoteId();
+    target = NoteFilesDirectory() + L"\\" + id + L".note";
+  }
+
+  wchar_t header[160] = {};
+  _snwprintf_s(header, _countof(header), _TRUNCATE,
+               L"x=%ld\ny=%ld\nw=%ld\nh=%ld\n\n", rect.left, rect.top,
+               rect.right - rect.left, rect.bottom - rect.top);
+  std::string bytes = ToUtf8(header);
+  bytes += ToUtf8(entry.text);
+  if (!WriteAllBytes(target, bytes)) {
+    LogLine(L"history: restore write failed id=%s path=%s", id.c_str(),
+            target.c_str());
+    return false;
+  }
+  DeleteFileW(HistoryFilePath(entry.id).c_str());
+
+  auto* state = new (std::nothrow) NoteState();
+  if (!state) return true;
+
+  const POINT stored = {rect.left, rect.top};
+  const UINT dpi = DpiForPoint(stored);
+  state->dpi = dpi;
+  state->width = std::max(ScaleFor(dpi, kMinWidth),
+                          static_cast<int>(rect.right - rect.left));
+  state->height = std::max(ScaleFor(dpi, kMinHeight),
+                           static_cast<int>(rect.bottom - rect.top));
+  state->id = id;
+  state->initialText = entry.text;
+  state->lastSaved = entry.text;
+  state->info = L"已保存";
+  const POINT position = ClampToWorkArea(stored, state->width, state->height);
+  if (!CreateNoteWindow(state, position, true)) return false;
+
+  LogLine(L"history: restored id=%s (was %s)", id.c_str(), entry.id.c_str());
+  return true;
+}
+
+// The only path that actually destroys note text.
+bool PurgeHistoryEntry(const std::wstring& id) {
+  const bool ok = DeleteFileW(HistoryFilePath(id).c_str()) != FALSE;
+  LogLine(L"history: purge id=%s ok=%d", id.c_str(), ok ? 1 : 0);
+  return ok;
+}
+
+int ClearHistory() {
+  int removed = 0;
+  for (const HistoryEntry& entry : LoadHistory()) {
+    if (PurgeHistoryEntry(entry.id)) ++removed;
+  }
+  LogLine(L"history: cleared %d entrie(s)", removed);
+  return removed;
+}
+
 void CreateNoteNearCursor() {
   POINT cursor = {};
   GetCursorPos(&cursor);
@@ -1633,10 +1889,23 @@ constexpr int kListIdOpen = 102;
 constexpr int kListIdDelete = 103;
 constexpr int kListIdClose = 104;
 constexpr int kListIdSettings = 105;
+constexpr int kListIdHistory = 106;
+
+constexpr int kHistoryIdListbox = 300;
+constexpr int kHistoryIdRestore = 301;
+constexpr int kHistoryIdPurge = 302;
+constexpr int kHistoryIdClear = 303;
+constexpr int kHistoryIdClose = 304;
 
 HWND g_list = nullptr;
 HWND g_listListbox = nullptr;
 HFONT g_listFont = nullptr;
+
+HWND g_historyList = nullptr;
+HFONT g_historyFont = nullptr;
+// Snapshot backing the listbox: LB_GETITEMDATA indexes into this, so it must not
+// be reloaded while the window is showing a selection.
+std::vector<HistoryEntry> g_historyEntries;
 
 void RefreshNotesList() {
   if (!g_listListbox) return;
@@ -1682,6 +1951,7 @@ void LayoutNotesList() {
   const int y = listBottom + margin;
   HWND buttons[] = {GetDlgItem(g_list, kListIdNew),
                     GetDlgItem(g_list, kListIdOpen),
+                    GetDlgItem(g_list, kListIdHistory),
                     GetDlgItem(g_list, kListIdSettings),
                     GetDlgItem(g_list, kListIdDelete)};
   for (HWND button : buttons) {
@@ -1707,13 +1977,19 @@ void DeleteSelectedNote() {
   const int index = SelectedNoteIndex();
   if (index < 0) return;
   NoteState* note = g_notes[static_cast<size_t>(index)];
-  if (MessageBoxW(g_list, L"删除这张便签？\n\n删除后无法恢复。", L"删除便签",
+  if (MessageBoxW(g_list, L"删除这张便签？\n\n它会移到历史里，可以从历史恢复。",
+                  L"删除便签",
                   MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
     return;
   }
-  DeleteNoteFile(note);
+  if (!MoveNoteToHistory(note, L"list")) {
+    MessageBoxW(g_list, L"无法移到历史（便签文件写入失败），便签已保留。",
+                L"删除失败", MB_OK | MB_ICONWARNING);
+    return;
+  }
   if (note->hwnd) DestroyWindow(note->hwnd);
   RefreshNotesList();
+  if (g_history) RefreshHistoryList();
 }
 
 LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
@@ -1745,6 +2021,7 @@ LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
       const ButtonSpec buttons[] = {
           {kListIdNew, L"新建"},
           {kListIdOpen, L"打开"},
+          {kListIdHistory, L"历史"},
           {kListIdSettings, L"设置"},
           {kListIdDelete, L"删除"},
           {kListIdClose, L"关闭"},
@@ -1808,6 +2085,10 @@ LRESULT CALLBACK ListWndProc(HWND hwnd, UINT message, WPARAM wparam,
         ShowHotkeySettings();
         return 0;
       }
+      if (id == kListIdHistory) {
+        ShowHistoryWindow();
+        return 0;
+      }
       if (id == kListIdDelete) {
         DeleteSelectedNote();
         return 0;
@@ -1855,7 +2136,8 @@ void EnsureListWindow() {
   }
   const UINT dpi = DpiForPoint({0, 0});
   RECT work = WorkAreaForPoint({0, 0});
-  const int width = ScaleFor(dpi, 470);
+  // Wide enough for six buttons in the footer; five already filled 470.
+  const int width = ScaleFor(dpi, 560);
   const int height = ScaleFor(dpi, 400);
   g_list = CreateWindowExW(
       WS_EX_TOOLWINDOW, kListClass, L"便签列表",
@@ -1881,6 +2163,314 @@ void ToggleNotesList() {
   } else {
     ShowNotesList();
   }
+}
+
+// ------------------------------------------------------------------ history
+//
+// A window over the history directory. Deleting here is the only action that
+// destroys note text; everything else in the app only moves files around.
+
+std::wstring FirstLinePreview(const std::wstring& text, size_t limit) {
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = text.find(L'\n', start);
+    if (end == std::wstring::npos) end = text.size();
+    std::wstring line = text.substr(start, end - start);
+    while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' ||
+                             line.back() == L'\t')) {
+      line.pop_back();
+    }
+    const size_t first = line.find_first_not_of(L" \t");
+    if (first != std::wstring::npos) {
+      line = line.substr(first);
+      if (line.size() > limit) line = line.substr(0, limit) + L"…";
+      return line;
+    }
+    start = end + 1;
+  }
+  return std::wstring();
+}
+
+std::wstring HistoryLabel(const HistoryEntry& entry) {
+  std::wstring preview = FirstLinePreview(entry.text, 28);
+  if (preview.empty()) preview = L"（无内容）";
+
+  wchar_t stamp[32] = {};
+  if (entry.deletedAt > 0) {
+    const SYSTEMTIME local = LocalTimeFromUnix(entry.deletedAt);
+    _snwprintf_s(stamp, _countof(stamp), _TRUNCATE, L"%02u-%02u %02u:%02u",
+                 local.wMonth, local.wDay, local.wHour, local.wMinute);
+  } else {
+    wcscpy_s(stamp, L"--");
+  }
+  return std::wstring(L"[") + stamp + L"] " + preview;
+}
+
+void RefreshHistoryList() {
+  if (!g_historyList) return;
+  g_historyEntries = LoadHistory();
+  SendMessageW(g_historyList, LB_RESETCONTENT, 0, 0);
+  for (size_t index = 0; index < g_historyEntries.size(); ++index) {
+    const std::wstring label = HistoryLabel(g_historyEntries[index]);
+    const LRESULT item = SendMessageW(
+        g_historyList, LB_ADDSTRING, 0,
+        reinterpret_cast<LPARAM>(label.c_str()));
+    if (item >= 0) {
+      SendMessageW(g_historyList, LB_SETITEMDATA, static_cast<WPARAM>(item),
+                   static_cast<LPARAM>(index));
+    }
+  }
+  if (g_history) InvalidateRect(g_history, nullptr, FALSE);
+}
+
+int SelectedHistoryIndex() {
+  if (!g_historyList) return -1;
+  const LRESULT selection = SendMessageW(g_historyList, LB_GETCURSEL, 0, 0);
+  if (selection < 0) return -1;
+  const LRESULT data = SendMessageW(g_historyList, LB_GETITEMDATA, selection, 0);
+  if (data < 0 || static_cast<size_t>(data) >= g_historyEntries.size()) return -1;
+  return static_cast<int>(data);
+}
+
+void LayoutHistoryWindow() {
+  if (!g_history) return;
+  RECT client = {};
+  GetClientRect(g_history, &client);
+  const UINT dpi = GetDpiForWindow(g_history);
+  const int margin = ScaleFor(dpi, 12);
+  const int buttonHeight = ScaleFor(dpi, 30);
+  const int buttonWidth = ScaleFor(dpi, 84);
+  const int listBottom = client.bottom - margin - buttonHeight - margin;
+
+  if (g_historyList) {
+    MoveWindow(g_historyList, margin, margin, client.right - margin * 2,
+               listBottom - margin, TRUE);
+  }
+
+  int x = margin;
+  const int y = listBottom + margin;
+  HWND buttons[] = {GetDlgItem(g_history, kHistoryIdRestore),
+                    GetDlgItem(g_history, kHistoryIdPurge),
+                    GetDlgItem(g_history, kHistoryIdClear)};
+  for (HWND button : buttons) {
+    if (!button) continue;
+    MoveWindow(button, x, y, buttonWidth, buttonHeight, TRUE);
+    x += buttonWidth + ScaleFor(dpi, 8);
+  }
+  HWND close = GetDlgItem(g_history, kHistoryIdClose);
+  if (close) {
+    MoveWindow(close, client.right - margin - buttonWidth, y, buttonWidth,
+               buttonHeight, TRUE);
+  }
+}
+
+void PaintHistoryWindow(HWND hwnd) {
+  PAINTSTRUCT ps = {};
+  HDC dc = BeginPaint(hwnd, &ps);
+  RECT client = {};
+  GetClientRect(hwnd, &client);
+  HBRUSH paper = CreateSolidBrush(kPaper);
+  FillRect(dc, &client, paper);
+  DeleteObject(paper);
+
+  if (g_historyEntries.empty()) {
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, kInkMuted);
+    HGDIOBJ oldFont = g_historyFont ? SelectObject(dc, g_historyFont) : nullptr;
+    RECT area = client;
+    area.bottom -= ScaleFor(GetDpiForWindow(hwnd), 60);
+    DrawTextW(dc, L"还没有删除过便签。\n删除的便签会先放到这里，可以恢复。", -1,
+              &area, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+    if (oldFont) SelectObject(dc, oldFont);
+  }
+  EndPaint(hwnd, &ps);
+}
+
+void RestoreSelectedHistory() {
+  const int index = SelectedHistoryIndex();
+  if (index < 0) return;
+  if (!RestoreHistoryEntry(g_historyEntries[static_cast<size_t>(index)])) {
+    MessageBoxW(g_history, L"恢复失败：无法写入便签文件。", L"恢复便签",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+  RefreshHistoryList();
+  RefreshNotesList();
+}
+
+void PurgeSelectedHistory() {
+  const int index = SelectedHistoryIndex();
+  if (index < 0) return;
+  const HistoryEntry entry = g_historyEntries[static_cast<size_t>(index)];
+  if (MessageBoxW(g_history, L"永久删除这条便签？\n\n删除后无法恢复。",
+                  L"永久删除", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) !=
+      IDYES) {
+    return;
+  }
+  PurgeHistoryEntry(entry.id);
+  RefreshHistoryList();
+}
+
+void ClearHistoryWithConfirm() {
+  const int count = static_cast<int>(g_historyEntries.size());
+  if (count <= 0) return;
+  wchar_t message[256] = {};
+  _snwprintf_s(message, _countof(message), _TRUNCATE,
+               L"清空全部 %d 条历史便签？\n\n删除后无法恢复。", count);
+  if (MessageBoxW(g_history, message, L"清空历史",
+                  MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+    return;
+  }
+  ClearHistory();
+  RefreshHistoryList();
+}
+
+LRESULT CALLBACK HistoryWndProc(HWND hwnd, UINT message, WPARAM wparam,
+                                LPARAM lparam) {
+  switch (message) {
+    case WM_CREATE: {
+      const UINT dpi = GetDpiForWindow(hwnd);
+      g_historyFont = CreateFontW(
+          -MulDiv(10, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE,
+          FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+          DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+
+      g_historyList = CreateWindowExW(
+          0, L"LISTBOX", L"",
+          WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY |
+              LBS_NOINTEGRALHEIGHT,
+          0, 0, 0, 0, hwnd,
+          reinterpret_cast<HMENU>(static_cast<INT_PTR>(kHistoryIdListbox)),
+          g_instance, nullptr);
+      if (g_historyList && g_historyFont) {
+        SendMessageW(g_historyList, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(g_historyFont), TRUE);
+      }
+
+      struct ButtonSpec {
+        int id;
+        const wchar_t* text;
+      };
+      const ButtonSpec buttons[] = {
+          {kHistoryIdRestore, L"恢复"},
+          {kHistoryIdPurge, L"永久删除"},
+          {kHistoryIdClear, L"清空历史"},
+          {kHistoryIdClose, L"关闭"},
+      };
+      for (const ButtonSpec& spec : buttons) {
+        HWND button = CreateWindowExW(
+            0, L"BUTTON", spec.text,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(spec.id)), g_instance,
+            nullptr);
+        if (button && g_historyFont) {
+          SendMessageW(button, WM_SETFONT,
+                       reinterpret_cast<WPARAM>(g_historyFont), TRUE);
+        }
+      }
+      LayoutHistoryWindow();
+      return 0;
+    }
+
+    case WM_SIZE:
+      LayoutHistoryWindow();
+      return 0;
+
+    case WM_PAINT:
+      PaintHistoryWindow(hwnd);
+      return 0;
+
+    case WM_ERASEBKGND:
+      return 1;
+
+    case WM_DRAWITEM:
+      PaintPaperButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lparam));
+      return TRUE;
+
+    case WM_CTLCOLORLISTBOX: {
+      HDC dc = reinterpret_cast<HDC>(wparam);
+      SetTextColor(dc, kInk);
+      SetBkColor(dc, kPaper);
+      if (!g_listBrush) g_listBrush = CreateSolidBrush(kPaper);
+      return reinterpret_cast<LRESULT>(g_listBrush);
+    }
+
+    case WM_COMMAND: {
+      const int id = LOWORD(wparam);
+      if (id == kHistoryIdRestore) {
+        RestoreSelectedHistory();
+        return 0;
+      }
+      if (id == kHistoryIdPurge) {
+        PurgeSelectedHistory();
+        return 0;
+      }
+      if (id == kHistoryIdClear) {
+        ClearHistoryWithConfirm();
+        return 0;
+      }
+      if (id == kHistoryIdClose) {
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+      }
+      if (id == kHistoryIdListbox && HIWORD(wparam) == LBN_DBLCLK) {
+        RestoreSelectedHistory();
+        return 0;
+      }
+      break;
+    }
+
+    case WM_CLOSE:
+      ShowWindow(hwnd, SW_HIDE);
+      return 0;
+
+    case WM_DESTROY:
+      if (g_historyFont) {
+        DeleteObject(g_historyFont);
+        g_historyFont = nullptr;
+      }
+      g_historyList = nullptr;
+      g_history = nullptr;
+      return 0;
+  }
+  return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+void EnsureHistoryWindow() {
+  if (g_history) return;
+  static bool registered = false;
+  if (!registered) {
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = HistoryWndProc;
+    wc.hInstance = g_instance;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = kHistoryClass;
+    RegisterClassExW(&wc);
+    registered = true;
+  }
+  const UINT dpi = DpiForPoint({0, 0});
+  RECT work = WorkAreaForPoint({0, 0});
+  const int width = ScaleFor(dpi, 470);
+  const int height = ScaleFor(dpi, 430);
+  g_history = CreateWindowExW(
+      WS_EX_TOOLWINDOW, kHistoryClass, L"历史便签",
+      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX,
+      work.left + ScaleFor(dpi, 120), work.top + ScaleFor(dpi, 120), width,
+      height, nullptr, nullptr, g_instance, nullptr);
+}
+
+void ShowHistoryWindow() {
+  EnsureHistoryWindow();
+  if (!g_history) return;
+  RefreshHistoryList();
+  ShowWindow(g_history, SW_SHOW);
+  SetWindowPos(g_history, HWND_TOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+  SetWindowPos(g_history, HWND_NOTOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
 }
 
 // ------------------------------------------------------------- hotkey setup
